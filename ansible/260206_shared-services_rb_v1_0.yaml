@@ -1,0 +1,300 @@
+---
+# =============================================================================
+# Shared Services - PostgreSQL + Redis for Lakehouse Platform
+# =============================================================================
+# Playbook: 260206_shared-services_rb_v1_0.yaml
+# Purpose:  Deploy shared PostgreSQL and Redis instances
+# Depends:  seaweedfs_default network
+# Deploy:   ansible-playbook 260206_shared-services_rb_v1_0.yaml
+# Ports:    PostgreSQL 5432, Redis 6379
+# Users:    Nessie, Airflow, Superset all share these services
+# =============================================================================
+
+- name: Deploy Shared Services (PostgreSQL + Redis)
+  hosts: localhost
+  connection: local
+  become: true
+
+  vars:
+    shared_services_dir: /opt/lakehouse/shared-services
+    lakehouse_user: "{{ ansible_env.SUDO_USER | default(ansible_user_id) }}"
+    shared_network: "seaweedfs_default"
+
+    # PostgreSQL
+    postgres_image: "postgres:15-alpine"
+    postgres_container: "lakehouse-postgres"
+    postgres_port: 5432
+    postgres_user: "lakehouse"
+    postgres_password: "lakehouse"
+
+    # Redis
+    redis_image: "redis:7-alpine"
+    redis_container: "lakehouse-redis"
+    redis_port: 6379
+
+  tasks:
+    # =========================================================================
+    # PRE-FLIGHT CHECKS
+    # =========================================================================
+    - name: Pre-flight - Verify nerdctl is available
+      become: false
+      ansible.builtin.command: nerdctl --version
+      changed_when: false
+
+    - name: Pre-flight - Verify shared network exists
+      become: false
+      ansible.builtin.command: nerdctl network inspect {{ shared_network }}
+      register: net_check
+      changed_when: false
+      failed_when: false
+
+    - name: Pre-flight - Fail if network missing
+      ansible.builtin.fail:
+        msg: >
+          FATAL: Network '{{ shared_network }}' not found.
+          Deploy SeaweedFS first to create the shared network.
+      when: net_check.rc != 0
+
+    - name: Pre-flight - Check port 5432 availability
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ postgres_port }}"
+        timeout: 1
+        state: stopped
+      register: port_check_pg
+      failed_when: false
+
+    - name: Pre-flight - Check port 6379 availability
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ redis_port }}"
+        timeout: 1
+        state: stopped
+      register: port_check_redis
+      failed_when: false
+
+    # =========================================================================
+    # DIRECTORY SETUP
+    # =========================================================================
+    - name: Create shared services directory structure
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ lakehouse_user }}"
+        mode: "0755"
+      loop:
+        - "{{ shared_services_dir }}"
+        - "{{ shared_services_dir }}/postgres-data"
+        - "{{ shared_services_dir }}/redis-data"
+
+    # =========================================================================
+    # INIT SCRIPT FOR MULTIPLE DATABASES
+    # =========================================================================
+    - name: Write PostgreSQL init script for multiple databases
+      ansible.builtin.copy:
+        dest: "{{ shared_services_dir }}/init-databases.sh"
+        owner: "{{ lakehouse_user }}"
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          set -e
+
+          # Create databases for all lakehouse components
+          # This script runs only on first PostgreSQL initialization
+
+          function create_database() {
+            local database=$1
+            echo "Creating database: $database"
+            psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+              SELECT 'CREATE DATABASE $database'
+              WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '$database')\gexec
+              GRANT ALL PRIVILEGES ON DATABASE $database TO $POSTGRES_USER;
+          EOSQL
+            echo "Database $database created successfully."
+          }
+
+          create_database "nessie"
+          create_database "airflow"
+          create_database "superset"
+
+          echo "All lakehouse databases initialized."
+
+    # =========================================================================
+    # COMPOSE FILE
+    # =========================================================================
+    - name: Write shared services compose.yaml
+      ansible.builtin.copy:
+        dest: "{{ shared_services_dir }}/compose.yaml"
+        owner: "{{ lakehouse_user }}"
+        mode: "0644"
+        content: |
+          version: "3.9"
+
+          services:
+            postgres:
+              image: {{ postgres_image }}
+              container_name: {{ postgres_container }}
+              environment:
+                POSTGRES_USER: {{ postgres_user }}
+                POSTGRES_PASSWORD: {{ postgres_password }}
+                POSTGRES_DB: {{ postgres_user }}
+              ports:
+                - "{{ postgres_port }}:5432"
+              volumes:
+                - ./postgres-data:/var/lib/postgresql/data
+                - ./init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh
+              restart: unless-stopped
+              healthcheck:
+                test: ["CMD-SHELL", "pg_isready -U {{ postgres_user }}"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+
+            redis:
+              image: {{ redis_image }}
+              container_name: {{ redis_container }}
+              ports:
+                - "{{ redis_port }}:6379"
+              volumes:
+                - ./redis-data:/data
+              command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+              restart: unless-stopped
+              healthcheck:
+                test: ["CMD", "redis-cli", "ping"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+
+          networks:
+            default:
+              external: true
+              name: {{ shared_network }}
+
+    # =========================================================================
+    # CONTAINER DEPLOYMENT
+    # =========================================================================
+    - name: Check if PostgreSQL container exists
+      become: false
+      ansible.builtin.command: nerdctl inspect {{ postgres_container }}
+      register: pg_container_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check if Redis container exists
+      become: false
+      ansible.builtin.command: nerdctl inspect {{ redis_container }}
+      register: redis_container_check
+      changed_when: false
+      failed_when: false
+
+    - name: Stop existing shared services (for idempotency)
+      become: false
+      ansible.builtin.command: nerdctl compose -f compose.yaml down
+      args:
+        chdir: "{{ shared_services_dir }}"
+      when: pg_container_check.rc == 0 or redis_container_check.rc == 0
+      changed_when: true
+      failed_when: false
+
+    - name: Pull PostgreSQL image
+      become: false
+      ansible.builtin.command: nerdctl pull {{ postgres_image }}
+      changed_when: false
+      failed_when: false
+
+    - name: Pull Redis image
+      become: false
+      ansible.builtin.command: nerdctl pull {{ redis_image }}
+      changed_when: false
+      failed_when: false
+
+    - name: Deploy shared services with nerdctl compose
+      become: false
+      ansible.builtin.command: nerdctl compose -f compose.yaml up -d
+      args:
+        chdir: "{{ shared_services_dir }}"
+      register: compose_result
+      changed_when: true
+
+    # =========================================================================
+    # POST-DEPLOYMENT VERIFICATION
+    # =========================================================================
+    - name: Wait for PostgreSQL to be ready
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ postgres_port }}"
+        timeout: 60
+        state: started
+
+    - name: Wait for Redis to be ready
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ redis_port }}"
+        timeout: 30
+        state: started
+
+    - name: Wait additional time for PostgreSQL init scripts
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Verify PostgreSQL is accepting connections
+      become: false
+      ansible.builtin.command: >
+        nerdctl exec {{ postgres_container }}
+        pg_isready -U {{ postgres_user }}
+      register: pg_ready
+      retries: 5
+      delay: 5
+      until: pg_ready.rc == 0
+      changed_when: false
+
+    - name: Verify databases were created
+      become: false
+      ansible.builtin.command: >
+        nerdctl exec {{ postgres_container }}
+        psql -U {{ postgres_user }} -d {{ postgres_user }}
+        -t -c "SELECT datname FROM pg_database WHERE datname IN ('nessie','airflow','superset') ORDER BY datname;"
+      register: db_list
+      changed_when: false
+      failed_when: false
+
+    - name: Show database verification
+      ansible.builtin.debug:
+        msg: "Databases found: {{ db_list.stdout | trim }}"
+
+    - name: Verify Redis is responding
+      become: false
+      ansible.builtin.command: >
+        nerdctl exec {{ redis_container }}
+        redis-cli ping
+      register: redis_ping
+      retries: 3
+      delay: 3
+      until: "'PONG' in redis_ping.stdout"
+      changed_when: false
+
+    - name: Show shared services deployment info
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          Shared Services deployed successfully!
+          ============================================
+
+          PostgreSQL:
+            Host (from host):      localhost:{{ postgres_port }}
+            Host (from container): {{ postgres_container }}:5432
+            User:                  {{ postgres_user }}
+            Password:              {{ postgres_password }}
+            Databases:             nessie, airflow, superset
+
+          Redis:
+            Host (from host):      localhost:{{ redis_port }}
+            Host (from container): {{ redis_container }}:6379
+            Persistence:           AOF enabled
+
+          Connection strings:
+            Nessie:   jdbc:postgresql://{{ postgres_container }}:5432/nessie
+            Airflow:  postgresql+psycopg2://{{ postgres_user }}:{{ postgres_password }}@{{ postgres_container }}:5432/airflow
+            Superset: postgresql+psycopg2://{{ postgres_user }}:{{ postgres_password }}@{{ postgres_container }}:5432/superset
+
+          ============================================

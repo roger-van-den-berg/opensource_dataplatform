@@ -1,0 +1,326 @@
+---
+# =============================================================================
+# JupyterLab - Data Science Workbench with PySpark
+# =============================================================================
+# Playbook: 260206_jupyter-pyspark_rb_v1_0.yaml
+# Purpose:  Deploy JupyterLab with PySpark, S3, and Nessie integration
+# Depends:  seaweedfs_default network, Spark Master, SeaweedFS S3
+# Deploy:   ansible-playbook 260206_jupyter-pyspark_rb_v1_0.yaml
+# Access:   http://localhost:8889 (token: lakehouse)
+# =============================================================================
+
+- name: Deploy JupyterLab with PySpark
+  hosts: localhost
+  connection: local
+  become: true
+
+  vars:
+    jupyter_dir: /opt/lakehouse/jupyter
+    lakehouse_user: "{{ ansible_env.SUDO_USER | default(ansible_user_id) }}"
+    shared_network: "seaweedfs_default"
+
+    # Jupyter configuration
+    jupyter_image: "jupyter/pyspark-notebook:latest"
+    jupyter_container: "jupyter"
+    jupyter_port: 8889
+    jupyter_token: "lakehouse"
+
+    # S3 credentials
+    s3_endpoint: "http://s3:8333"
+    s3_access_key: "dev"
+    s3_secret_key: "dev"
+
+    # Spark connection
+    spark_master_url: "spark://spark-master:7077"
+    spark_driver_memory: "512m"
+    spark_executor_memory: "512m"
+
+    # Additional Python packages
+    pip_packages:
+      - "duckdb"
+      - "polars"
+      - "pyarrow"
+      - "boto3"
+      - "s3fs"
+
+  tasks:
+    # =========================================================================
+    # PRE-FLIGHT CHECKS
+    # =========================================================================
+    - name: Pre-flight - Verify nerdctl is available
+      become: false
+      ansible.builtin.command: nerdctl --version
+      changed_when: false
+
+    - name: Pre-flight - Verify shared network exists
+      become: false
+      ansible.builtin.command: nerdctl network inspect {{ shared_network }}
+      register: net_check
+      changed_when: false
+      failed_when: false
+
+    - name: Pre-flight - Fail if network missing
+      ansible.builtin.fail:
+        msg: "FATAL: Network '{{ shared_network }}' not found."
+      when: net_check.rc != 0
+
+    # =========================================================================
+    # DIRECTORY SETUP
+    # =========================================================================
+    - name: Create Jupyter directory structure
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ lakehouse_user }}"
+        mode: "0755"
+      loop:
+        - "{{ jupyter_dir }}"
+        - "{{ jupyter_dir }}/notebooks"
+        - "{{ jupyter_dir }}/conf"
+
+    - name: Ensure notebooks directory is writable by Jupyter user (uid 1000)
+      ansible.builtin.file:
+        path: "{{ jupyter_dir }}/notebooks"
+        mode: "0777"
+        state: directory
+
+    # =========================================================================
+    # SPARK DEFAULTS CONFIGURATION
+    # =========================================================================
+    - name: Write spark-defaults.conf for Jupyter
+      ansible.builtin.copy:
+        dest: "{{ jupyter_dir }}/conf/spark-defaults.conf"
+        owner: "{{ lakehouse_user }}"
+        mode: "0644"
+        content: |
+          # S3A Configuration
+          spark.hadoop.fs.s3a.endpoint={{ s3_endpoint }}
+          spark.hadoop.fs.s3a.access.key={{ s3_access_key }}
+          spark.hadoop.fs.s3a.secret.key={{ s3_secret_key }}
+          spark.hadoop.fs.s3a.path.style.access=true
+          spark.hadoop.fs.s3a.connection.ssl.enabled=false
+          spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+
+          # Nessie Catalog
+          spark.sql.catalog.nessie=org.apache.iceberg.spark.SparkCatalog
+          spark.sql.catalog.nessie.catalog-impl=org.apache.iceberg.nessie.NessieCatalog
+          spark.sql.catalog.nessie.uri=http://nessie:19120/api/v1
+          spark.sql.catalog.nessie.ref=main
+          spark.sql.catalog.nessie.warehouse=s3a://lakehouse/warehouse/
+
+          # Memory tuning
+          spark.driver.memory={{ spark_driver_memory }}
+          spark.executor.memory={{ spark_executor_memory }}
+
+    # =========================================================================
+    # STARTER NOTEBOOK
+    # =========================================================================
+    - name: Write starter notebook for S3 + PySpark verification
+      ansible.builtin.copy:
+        dest: "{{ jupyter_dir }}/notebooks/00_getting_started.py"
+        owner: "{{ lakehouse_user }}"
+        mode: "0644"
+        content: |
+          # ---
+          # Lakehouse Platform - Getting Started
+          # ---
+          # This script verifies connectivity to all platform services.
+          # Run this in JupyterLab to verify your setup.
+
+          import os
+
+          print("=== Lakehouse Platform Connectivity Test ===\n")
+
+          # Test 1: S3 Connectivity via boto3
+          print("1. Testing S3 (SeaweedFS) connectivity...")
+          try:
+              import boto3
+              s3 = boto3.client(
+                  's3',
+                  endpoint_url=os.environ.get('AWS_ENDPOINT_URL', 'http://s3:8333'),
+                  aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID', 'dev'),
+                  aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY', 'dev'),
+                  region_name='us-east-1'
+              )
+              buckets = s3.list_buckets()
+              print(f"   OK - Found {len(buckets.get('Buckets', []))} buckets")
+          except Exception as e:
+              print(f"   FAILED - {e}")
+
+          # Test 2: PySpark
+          print("\n2. Testing PySpark...")
+          try:
+              from pyspark.sql import SparkSession
+              spark = SparkSession.builder \
+                  .appName("LakehouseTest") \
+                  .master("local[*]") \
+                  .getOrCreate()
+              print(f"   OK - Spark {spark.version}")
+              spark.stop()
+          except Exception as e:
+              print(f"   FAILED - {e}")
+
+          # Test 3: DuckDB
+          print("\n3. Testing DuckDB...")
+          try:
+              import duckdb
+              result = duckdb.sql("SELECT 'DuckDB OK' as status").fetchone()
+              print(f"   OK - {result[0]}")
+          except Exception as e:
+              print(f"   FAILED - {e}")
+
+          # Test 4: Polars
+          print("\n4. Testing Polars...")
+          try:
+              import polars as pl
+              df = pl.DataFrame({"test": [1, 2, 3]})
+              print(f"   OK - Polars {pl.__version__}")
+          except Exception as e:
+              print(f"   FAILED - {e}")
+
+          print("\n=== Tests Complete ===")
+
+    # =========================================================================
+    # COMPOSE FILE
+    # =========================================================================
+    - name: Write Jupyter compose.yaml
+      ansible.builtin.copy:
+        dest: "{{ jupyter_dir }}/compose.yaml"
+        owner: "{{ lakehouse_user }}"
+        mode: "0644"
+        content: |
+          version: "3.9"
+
+          services:
+            jupyter:
+              image: {{ jupyter_image }}
+              container_name: {{ jupyter_container }}
+              user: root
+              environment:
+                # Jupyter config
+                - JUPYTER_ENABLE_LAB=yes
+                - JUPYTER_TOKEN={{ jupyter_token }}
+                - GRANT_SUDO=yes
+                - CHOWN_HOME=yes
+                - NB_UID=1000
+                - NB_GID=100
+
+                # AWS/S3 credentials
+                - AWS_ACCESS_KEY_ID={{ s3_access_key }}
+                - AWS_SECRET_ACCESS_KEY={{ s3_secret_key }}
+                - AWS_ENDPOINT_URL={{ s3_endpoint }}
+                - AWS_DEFAULT_REGION=us-east-1
+
+                # Spark configuration
+                - SPARK_MASTER={{ spark_master_url }}
+                - SPARK_OPTS=--driver-memory {{ spark_driver_memory }} --executor-memory {{ spark_executor_memory }}
+              ports:
+                - "{{ jupyter_port }}:8888"
+              volumes:
+                - ./notebooks:/home/jovyan/work
+                - ./conf/spark-defaults.conf:/usr/local/spark/conf/spark-defaults.conf:ro
+              restart: unless-stopped
+
+          networks:
+            default:
+              external: true
+              name: {{ shared_network }}
+
+    # =========================================================================
+    # CONTAINER DEPLOYMENT
+    # =========================================================================
+    - name: Check if Jupyter container exists
+      become: false
+      ansible.builtin.command: nerdctl inspect {{ jupyter_container }}
+      register: jupyter_container_check
+      changed_when: false
+      failed_when: false
+
+    - name: Stop existing Jupyter container (for idempotency)
+      become: false
+      ansible.builtin.command: nerdctl compose -f compose.yaml down
+      args:
+        chdir: "{{ jupyter_dir }}"
+      when: jupyter_container_check.rc == 0
+      changed_when: true
+      failed_when: false
+
+    - name: Pull Jupyter image
+      become: false
+      ansible.builtin.command: nerdctl pull {{ jupyter_image }}
+      changed_when: false
+      failed_when: false
+
+    - name: Deploy Jupyter with nerdctl compose
+      become: false
+      ansible.builtin.command: nerdctl compose -f compose.yaml up -d
+      args:
+        chdir: "{{ jupyter_dir }}"
+      register: compose_result
+      changed_when: true
+
+    # =========================================================================
+    # POST-DEPLOYMENT: INSTALL EXTRA PACKAGES
+    # =========================================================================
+    - name: Wait for Jupyter to be ready
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ jupyter_port }}"
+        timeout: 120
+        state: started
+
+    - name: Wait for Jupyter to fully initialize
+      ansible.builtin.pause:
+        seconds: 10
+
+    - name: Install additional Python packages in Jupyter
+      become: false
+      ansible.builtin.command: >
+        nerdctl exec {{ jupyter_container }}
+        pip install --quiet {{ pip_packages | join(' ') }}
+      register: pip_install
+      changed_when: "'Successfully installed' in pip_install.stdout"
+      failed_when: false
+      retries: 3
+      delay: 15
+
+    # =========================================================================
+    # POST-DEPLOYMENT VERIFICATION
+    # =========================================================================
+    - name: Verify JupyterLab responds
+      ansible.builtin.uri:
+        url: "http://localhost:{{ jupyter_port }}/lab"
+        method: GET
+        status_code: [200, 302]
+        follow_redirects: safe
+      register: jupyter_health
+      retries: 5
+      delay: 10
+      until: jupyter_health.status is defined
+
+    - name: Show Jupyter deployment info
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          JupyterLab deployed successfully!
+          ============================================
+
+          URL:    http://localhost:{{ jupyter_port }}
+          Token:  {{ jupyter_token }}
+
+          Direct: http://localhost:{{ jupyter_port }}/lab?token={{ jupyter_token }}
+
+          Notebooks dir:   {{ jupyter_dir }}/notebooks
+          Spark config:    {{ jupyter_dir }}/conf/spark-defaults.conf
+
+          Pre-installed:
+            - PySpark (built-in)
+            - DuckDB, Polars, PyArrow, boto3, s3fs
+
+          S3 Environment:
+            AWS_ENDPOINT_URL={{ s3_endpoint }}
+            AWS_ACCESS_KEY_ID={{ s3_access_key }}
+
+          Starter notebook: work/00_getting_started.py
+
+          ============================================

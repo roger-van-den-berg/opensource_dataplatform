@@ -1,0 +1,374 @@
+---
+# =============================================================================
+# Apache Spark + Thrift Server - Distributed Processing Engine
+# =============================================================================
+# Playbook: 260206_spark-thrift_rb_v1_0.yaml
+# Purpose:  Deploy Spark Master, Worker, Thrift Server, and History Server
+# Depends:  seaweedfs_default network, SeaweedFS S3 (s3:8333)
+# Deploy:   ansible-playbook 260206_spark-thrift_rb_v1_0.yaml
+# Ports:    Master UI 8081, Worker UI 8082, RPC 7077,
+#           Thrift 10000, History 18080
+# =============================================================================
+
+- name: Deploy Apache Spark + Thrift Server
+  hosts: localhost
+  connection: local
+  become: true
+
+  vars:
+    spark_dir: /opt/lakehouse/spark
+    lakehouse_user: "{{ ansible_env.SUDO_USER | default(ansible_user_id) }}"
+    shared_network: "seaweedfs_default"
+
+    # Image and version
+    spark_image: "bitnami/spark:3.5.0"
+
+    # Container names
+    spark_master_container: "spark-master"
+    spark_worker_container: "spark-worker"
+    spark_thrift_container: "spark-thrift"
+    spark_history_container: "spark-history"
+
+    # Ports
+    spark_master_ui_port: 8081
+    spark_master_rpc_port: 7077
+    spark_worker_ui_port: 8082
+    spark_thrift_port: 10000
+    spark_history_port: 18080
+
+    # WSL-friendly memory settings
+    spark_driver_memory: "512m"
+    spark_executor_memory: "512m"
+    spark_worker_memory: "512m"
+    spark_worker_cores: 2
+
+    # S3A Configuration
+    s3_endpoint: "http://s3:8333"
+    s3_access_key: "dev"
+    s3_secret_key: "dev"
+
+    # Extra JAR URLs (Iceberg + Delta Lake)
+    extra_jars:
+      - url: "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.4.3/iceberg-spark-runtime-3.5_2.12-1.4.3.jar"
+        name: "iceberg-spark-runtime-3.5_2.12-1.4.3.jar"
+      - url: "https://repo1.maven.org/maven2/io/delta/delta-spark_2.12/3.0.0/delta-spark_2.12-3.0.0.jar"
+        name: "delta-spark_2.12-3.0.0.jar"
+      - url: "https://repo1.maven.org/maven2/io/delta/delta-storage/3.0.0/delta-storage-3.0.0.jar"
+        name: "delta-storage-3.0.0.jar"
+
+  tasks:
+    # =========================================================================
+    # PRE-FLIGHT CHECKS
+    # =========================================================================
+    - name: Pre-flight - Verify nerdctl is available
+      become: false
+      ansible.builtin.command: nerdctl --version
+      changed_when: false
+
+    - name: Pre-flight - Verify shared network exists
+      become: false
+      ansible.builtin.command: nerdctl network inspect {{ shared_network }}
+      register: net_check
+      changed_when: false
+      failed_when: false
+
+    - name: Pre-flight - Fail if network missing
+      ansible.builtin.fail:
+        msg: >
+          FATAL: Network '{{ shared_network }}' not found.
+          Deploy SeaweedFS first to create the shared network.
+      when: net_check.rc != 0
+
+    # =========================================================================
+    # DIRECTORY SETUP
+    # =========================================================================
+    - name: Create Spark directory structure
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ lakehouse_user }}"
+        mode: "0755"
+      loop:
+        - "{{ spark_dir }}"
+        - "{{ spark_dir }}/jars"
+        - "{{ spark_dir }}/spark-events"
+        - "{{ spark_dir }}/conf"
+
+    - name: Ensure spark-events is world-writable (for history server)
+      ansible.builtin.file:
+        path: "{{ spark_dir }}/spark-events"
+        mode: "0777"
+        state: directory
+
+    # =========================================================================
+    # DOWNLOAD EXTRA JARS (Iceberg, Delta Lake)
+    # =========================================================================
+    - name: Download extra Spark JARs
+      ansible.builtin.get_url:
+        url: "{{ item.url }}"
+        dest: "{{ spark_dir }}/jars/{{ item.name }}"
+        mode: "0644"
+      loop: "{{ extra_jars }}"
+      register: jar_download
+      retries: 3
+      delay: 10
+      until: jar_download is not failed
+
+    # =========================================================================
+    # COMPOSE FILE
+    # =========================================================================
+    - name: Write Spark compose.yaml
+      ansible.builtin.copy:
+        dest: "{{ spark_dir }}/compose.yaml"
+        owner: "{{ lakehouse_user }}"
+        mode: "0644"
+        content: |
+          version: "3.9"
+
+          services:
+            spark-master:
+              image: {{ spark_image }}
+              container_name: {{ spark_master_container }}
+              environment:
+                - SPARK_MODE=master
+                - SPARK_MASTER_HOST=spark-master
+                - SPARK_MASTER_PORT={{ spark_master_rpc_port }}
+                - SPARK_MASTER_WEBUI_PORT={{ spark_master_ui_port }}
+                - SPARK_DRIVER_MEMORY={{ spark_driver_memory }}
+                - SPARK_EXECUTOR_MEMORY={{ spark_executor_memory }}
+                # S3A Configuration
+                - SPARK_CONF_spark_hadoop_fs_s3a_endpoint={{ s3_endpoint }}
+                - SPARK_CONF_spark_hadoop_fs_s3a_access_key={{ s3_access_key }}
+                - SPARK_CONF_spark_hadoop_fs_s3a_secret_key={{ s3_secret_key }}
+                - SPARK_CONF_spark_hadoop_fs_s3a_path__style__access=true
+                - SPARK_CONF_spark_hadoop_fs_s3a_connection__ssl__enabled=false
+                - SPARK_CONF_spark_hadoop_fs_s3a_impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+                # Event logging
+                - SPARK_CONF_spark_eventLog_enabled=true
+                - SPARK_CONF_spark_eventLog_dir=/opt/bitnami/spark/spark-events
+              ports:
+                - "{{ spark_master_ui_port }}:{{ spark_master_ui_port }}"
+                - "{{ spark_master_rpc_port }}:{{ spark_master_rpc_port }}"
+              volumes:
+                - ./jars:/opt/bitnami/spark/jars-extra
+                - ./spark-events:/opt/bitnami/spark/spark-events
+              restart: unless-stopped
+
+            spark-worker:
+              image: {{ spark_image }}
+              container_name: {{ spark_worker_container }}
+              environment:
+                - SPARK_MODE=worker
+                - SPARK_MASTER_URL=spark://spark-master:{{ spark_master_rpc_port }}
+                - SPARK_WORKER_CORES={{ spark_worker_cores }}
+                - SPARK_WORKER_MEMORY={{ spark_worker_memory }}
+                - SPARK_EXECUTOR_MEMORY={{ spark_executor_memory }}
+                # S3A Configuration
+                - SPARK_CONF_spark_hadoop_fs_s3a_endpoint={{ s3_endpoint }}
+                - SPARK_CONF_spark_hadoop_fs_s3a_access_key={{ s3_access_key }}
+                - SPARK_CONF_spark_hadoop_fs_s3a_secret_key={{ s3_secret_key }}
+                - SPARK_CONF_spark_hadoop_fs_s3a_path__style__access=true
+                - SPARK_CONF_spark_hadoop_fs_s3a_connection__ssl__enabled=false
+                - SPARK_CONF_spark_hadoop_fs_s3a_impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+              ports:
+                - "{{ spark_worker_ui_port }}:8081"
+              volumes:
+                - ./jars:/opt/bitnami/spark/jars-extra
+                - ./spark-events:/opt/bitnami/spark/spark-events
+              depends_on:
+                - spark-master
+              restart: unless-stopped
+
+            spark-thrift:
+              image: {{ spark_image }}
+              container_name: {{ spark_thrift_container }}
+              environment:
+                - SPARK_MODE=worker
+                - SPARK_DRIVER_MEMORY={{ spark_driver_memory }}
+                # S3A Configuration
+                - SPARK_CONF_spark_hadoop_fs_s3a_endpoint={{ s3_endpoint }}
+                - SPARK_CONF_spark_hadoop_fs_s3a_access_key={{ s3_access_key }}
+                - SPARK_CONF_spark_hadoop_fs_s3a_secret_key={{ s3_secret_key }}
+                - SPARK_CONF_spark_hadoop_fs_s3a_path__style__access=true
+                - SPARK_CONF_spark_hadoop_fs_s3a_connection__ssl__enabled=false
+                - SPARK_CONF_spark_hadoop_fs_s3a_impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+              ports:
+                - "{{ spark_thrift_port }}:10000"
+              volumes:
+                - ./jars:/opt/bitnami/spark/jars-extra
+                - ./spark-events:/opt/bitnami/spark/spark-events
+              command: >
+                bash -c "
+                  /opt/bitnami/spark/sbin/start-thriftserver.sh
+                    --master spark://spark-master:{{ spark_master_rpc_port }}
+                    --hiveconf hive.server2.thrift.port=10000
+                    --hiveconf hive.server2.thrift.bind.host=0.0.0.0
+                    --driver-memory {{ spark_driver_memory }}
+                    --conf spark.hadoop.fs.s3a.endpoint={{ s3_endpoint }}
+                    --conf spark.hadoop.fs.s3a.access.key={{ s3_access_key }}
+                    --conf spark.hadoop.fs.s3a.secret.key={{ s3_secret_key }}
+                    --conf spark.hadoop.fs.s3a.path.style.access=true
+                    --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false
+                    --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+                  && tail -f /opt/bitnami/spark/logs/*thrift* 2>/dev/null || tail -f /dev/null
+                "
+              depends_on:
+                - spark-master
+              restart: unless-stopped
+
+            spark-history:
+              image: {{ spark_image }}
+              container_name: {{ spark_history_container }}
+              environment:
+                - SPARK_MODE=worker
+              ports:
+                - "{{ spark_history_port }}:18080"
+              volumes:
+                - ./spark-events:/opt/bitnami/spark/spark-events
+              command: >
+                bash -c "
+                  /opt/bitnami/spark/sbin/start-history-server.sh
+                    --properties-file /dev/null
+                  && tail -f /dev/null
+                "
+              depends_on:
+                - spark-master
+              restart: unless-stopped
+
+          networks:
+            default:
+              external: true
+              name: {{ shared_network }}
+
+    # =========================================================================
+    # SPARK DEFAULTS CONFIGURATION
+    # =========================================================================
+    - name: Write spark-defaults.conf
+      ansible.builtin.copy:
+        dest: "{{ spark_dir }}/conf/spark-defaults.conf"
+        owner: "{{ lakehouse_user }}"
+        mode: "0644"
+        content: |
+          # S3A Configuration
+          spark.hadoop.fs.s3a.endpoint={{ s3_endpoint }}
+          spark.hadoop.fs.s3a.access.key={{ s3_access_key }}
+          spark.hadoop.fs.s3a.secret.key={{ s3_secret_key }}
+          spark.hadoop.fs.s3a.path.style.access=true
+          spark.hadoop.fs.s3a.connection.ssl.enabled=false
+          spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+
+          # Nessie Catalog Integration
+          spark.sql.catalog.nessie=org.apache.iceberg.spark.SparkCatalog
+          spark.sql.catalog.nessie.catalog-impl=org.apache.iceberg.nessie.NessieCatalog
+          spark.sql.catalog.nessie.uri=http://nessie:19120/api/v1
+          spark.sql.catalog.nessie.ref=main
+          spark.sql.catalog.nessie.warehouse=s3a://lakehouse/warehouse/
+
+          # Event logging
+          spark.eventLog.enabled=true
+          spark.eventLog.dir=/opt/bitnami/spark/spark-events
+          spark.history.fs.logDirectory=/opt/bitnami/spark/spark-events
+
+          # Memory tuning
+          spark.driver.memory={{ spark_driver_memory }}
+          spark.executor.memory={{ spark_executor_memory }}
+
+    # =========================================================================
+    # CONTAINER DEPLOYMENT
+    # =========================================================================
+    - name: Check if Spark master container exists
+      become: false
+      ansible.builtin.command: nerdctl inspect {{ spark_master_container }}
+      register: spark_container_check
+      changed_when: false
+      failed_when: false
+
+    - name: Stop existing Spark containers (for idempotency)
+      become: false
+      ansible.builtin.command: nerdctl compose -f compose.yaml down
+      args:
+        chdir: "{{ spark_dir }}"
+      when: spark_container_check.rc == 0
+      changed_when: true
+      failed_when: false
+
+    - name: Pull Spark image
+      become: false
+      ansible.builtin.command: nerdctl pull {{ spark_image }}
+      changed_when: false
+      failed_when: false
+
+    - name: Deploy Spark with nerdctl compose
+      become: false
+      ansible.builtin.command: nerdctl compose -f compose.yaml up -d
+      args:
+        chdir: "{{ spark_dir }}"
+      register: compose_result
+      changed_when: true
+
+    # =========================================================================
+    # POST-DEPLOYMENT VERIFICATION
+    # =========================================================================
+    - name: Wait for Spark Master UI to be ready
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ spark_master_ui_port }}"
+        timeout: 90
+        state: started
+
+    - name: Wait for Spark Master RPC to be ready
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ spark_master_rpc_port }}"
+        timeout: 60
+        state: started
+
+    - name: Verify Spark Master UI responds
+      ansible.builtin.uri:
+        url: "http://localhost:{{ spark_master_ui_port }}"
+        method: GET
+        status_code: [200, 301, 302]
+      register: spark_ui_check
+      retries: 5
+      delay: 10
+      until: spark_ui_check.status is defined
+
+    - name: Wait for Thrift Server to initialize
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ spark_thrift_port }}"
+        timeout: 120
+        state: started
+      failed_when: false
+      register: thrift_wait
+
+    - name: Report Thrift Server status
+      ansible.builtin.debug:
+        msg: "{{ 'Thrift Server is ready on port ' ~ spark_thrift_port if thrift_wait is not failed else 'Thrift Server startup still in progress - may need more time' }}"
+
+    - name: Show Spark deployment info
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          Apache Spark deployed successfully!
+          ============================================
+
+          Spark Master UI:      http://localhost:{{ spark_master_ui_port }}
+          Spark Worker UI:      http://localhost:{{ spark_worker_ui_port }}
+          Spark Master RPC:     spark://spark-master:{{ spark_master_rpc_port }}
+          Thrift Server:        jdbc:hive2://localhost:{{ spark_thrift_port }}
+          History Server:       http://localhost:{{ spark_history_port }}
+
+          S3A Endpoint:         {{ s3_endpoint }}
+          Memory per service:   {{ spark_driver_memory }}
+
+          Extra JARs:           Iceberg 1.4.3, Delta Lake 3.0.0
+          Config:               {{ spark_dir }}/conf/spark-defaults.conf
+
+          Test with beeline:
+            nerdctl exec spark-thrift \
+              /opt/bitnami/spark/bin/beeline \
+              -u "jdbc:hive2://localhost:10000" \
+              -e "SHOW DATABASES;"
+
+          ============================================

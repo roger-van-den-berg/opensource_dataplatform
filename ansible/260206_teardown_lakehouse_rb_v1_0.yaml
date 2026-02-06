@@ -1,0 +1,136 @@
+---
+# =============================================================================
+# Teardown Playbook - Remove Lakehouse Platform Components
+# =============================================================================
+# Playbook: 260206_teardown_lakehouse_rb_v1_0.yaml
+# Purpose:  Stop and remove all lakehouse containers (preserves data by default)
+# Deploy:   ansible-playbook 260206_teardown_lakehouse_rb_v1_0.yaml
+# Data:     ansible-playbook 260206_teardown_lakehouse_rb_v1_0.yaml -e delete_data=true
+# =============================================================================
+
+- name: Teardown Lakehouse Platform
+  hosts: localhost
+  connection: local
+  become: true
+
+  vars:
+    lakehouse_user: "{{ ansible_env.SUDO_USER | default(ansible_user_id) }}"
+    delete_data: false  # Set to true to delete data volumes
+
+    # Containers to remove (reverse deployment order)
+    containers:
+      - superset
+      - superset-init
+      - airflow-scheduler
+      - airflow-webserver
+      - airflow-init
+      - trino
+      - jupyter
+      - nessie
+      - spark-history
+      - spark-thrift
+      - spark-worker
+      - spark-master
+      - lakehouse-redis
+      - lakehouse-postgres
+      - homer
+
+    # Component directories for compose down
+    component_dirs:
+      - /opt/lakehouse/superset
+      - /opt/lakehouse/airflow
+      - /opt/lakehouse/trino
+      - /opt/lakehouse/jupyter
+      - /opt/lakehouse/nessie
+      - /opt/lakehouse/spark
+      - /opt/lakehouse/shared-services
+      - /opt/lakehouse/homer
+
+  tasks:
+    # =========================================================================
+    # GRACEFUL COMPOSE DOWN
+    # =========================================================================
+    - name: "=== Stopping services with compose down ==="
+      ansible.builtin.debug:
+        msg: "Attempting graceful shutdown of all lakehouse components..."
+
+    - name: Compose down for each component
+      become: false
+      ansible.builtin.command: nerdctl compose -f compose.yaml down
+      args:
+        chdir: "{{ item }}"
+      loop: "{{ component_dirs }}"
+      register: compose_down
+      failed_when: false
+      changed_when: compose_down.rc == 0
+
+    # =========================================================================
+    # FORCE REMOVE REMAINING CONTAINERS
+    # =========================================================================
+    - name: Force remove any remaining containers
+      become: false
+      ansible.builtin.command: nerdctl rm -f {{ item }}
+      loop: "{{ containers }}"
+      register: container_removal
+      failed_when: false
+      changed_when: container_removal.rc == 0
+
+    # =========================================================================
+    # DATA CLEANUP (OPTIONAL)
+    # =========================================================================
+    - name: "=== Data Cleanup ==="
+      ansible.builtin.debug:
+        msg: |
+          {% if delete_data | bool %}
+          WARNING: Deleting all data directories!
+          {% else %}
+          Data preserved in /opt/lakehouse/
+          To delete data, rerun with: -e delete_data=true
+          {% endif %}
+
+    - name: Remove data directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /opt/lakehouse/superset
+        - /opt/lakehouse/airflow
+        - /opt/lakehouse/trino
+        - /opt/lakehouse/jupyter
+        - /opt/lakehouse/nessie
+        - /opt/lakehouse/spark
+        - /opt/lakehouse/shared-services
+        - /opt/lakehouse/homer
+      when: delete_data | bool
+
+    # =========================================================================
+    # VERIFICATION
+    # =========================================================================
+    - name: List remaining lakehouse containers
+      become: false
+      ansible.builtin.shell: |
+        nerdctl ps -a --format '{{ '{{' }}.Names{{ '}}' }}' 2>/dev/null | grep -E '(homer|lakehouse|spark|nessie|jupyter|trino|airflow|superset)' || echo "none"
+      register: remaining_containers
+      changed_when: false
+
+    - name: Show teardown summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          LAKEHOUSE TEARDOWN COMPLETE
+          ============================================
+
+          Containers stopped and removed.
+          Remaining: {{ remaining_containers.stdout }}
+
+          Data: {{ 'DELETED' if delete_data | bool else 'PRESERVED in /opt/lakehouse/' }}
+
+          Note: SeaweedFS and Databend are NOT affected.
+
+          To redeploy:
+            ansible-playbook 260206_deploy_all_lakehouse_rb_v1_0.yaml
+
+          To delete data too:
+            ansible-playbook 260206_teardown_lakehouse_rb_v1_0.yaml -e delete_data=true
+
+          ============================================

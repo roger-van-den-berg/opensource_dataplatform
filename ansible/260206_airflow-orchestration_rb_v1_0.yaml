@@ -1,0 +1,364 @@
+---
+# =============================================================================
+# Apache Airflow - Workflow Orchestration
+# =============================================================================
+# Playbook: 260206_airflow-orchestration_rb_v1_0.yaml
+# Purpose:  Deploy Airflow with LocalExecutor, PostgreSQL backend
+# Depends:  seaweedfs_default network, Shared Services (PostgreSQL)
+# Deploy:   ansible-playbook 260206_airflow-orchestration_rb_v1_0.yaml
+# Access:   http://localhost:8086 (admin/admin)
+# =============================================================================
+
+- name: Deploy Apache Airflow
+  hosts: localhost
+  connection: local
+  become: true
+
+  vars:
+    airflow_dir: /opt/lakehouse/airflow
+    lakehouse_user: "{{ ansible_env.SUDO_USER | default(ansible_user_id) }}"
+    shared_network: "seaweedfs_default"
+
+    # Airflow configuration
+    airflow_image: "apache/airflow:2.8.1"
+    airflow_port: 8086
+
+    # Container names
+    airflow_init_container: "airflow-init"
+    airflow_webserver_container: "airflow-webserver"
+    airflow_scheduler_container: "airflow-scheduler"
+
+    # Executor
+    airflow_executor: "LocalExecutor"
+
+    # Database (shared PostgreSQL)
+    postgres_container: "lakehouse-postgres"
+    postgres_host: "lakehouse-postgres"
+    postgres_port: 5432
+    postgres_db: "airflow"
+    postgres_user: "lakehouse"
+    postgres_password: "lakehouse"
+
+    # Admin user
+    airflow_admin_user: "admin"
+    airflow_admin_password: "admin"
+    airflow_admin_email: "admin@lakehouse.local"
+
+  tasks:
+    # =========================================================================
+    # PRE-FLIGHT CHECKS
+    # =========================================================================
+    - name: Pre-flight - Verify nerdctl is available
+      become: false
+      ansible.builtin.command: nerdctl --version
+      changed_when: false
+
+    - name: Pre-flight - Verify shared network exists
+      become: false
+      ansible.builtin.command: nerdctl network inspect {{ shared_network }}
+      register: net_check
+      changed_when: false
+      failed_when: false
+
+    - name: Pre-flight - Fail if network missing
+      ansible.builtin.fail:
+        msg: "FATAL: Network '{{ shared_network }}' not found."
+      when: net_check.rc != 0
+
+    - name: Pre-flight - Verify PostgreSQL is running
+      become: false
+      ansible.builtin.command: nerdctl inspect {{ postgres_container }}
+      register: pg_check
+      changed_when: false
+      failed_when: false
+
+    - name: Pre-flight - Fail if PostgreSQL not running
+      ansible.builtin.fail:
+        msg: >
+          FATAL: PostgreSQL container '{{ postgres_container }}' not found.
+          Deploy shared services first:
+          ansible-playbook 260206_shared-services_rb_v1_0.yaml
+      when: pg_check.rc != 0
+
+    # =========================================================================
+    # GENERATE FERNET KEY
+    # =========================================================================
+    - name: Check for existing Fernet key
+      ansible.builtin.stat:
+        path: "{{ airflow_dir }}/.fernet_key"
+      register: fernet_file
+
+    - name: Generate Fernet key for Airflow
+      ansible.builtin.shell: |
+        python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+      register: fernet_key_gen
+      changed_when: false
+      when: not fernet_file.stat.exists
+      failed_when: false
+
+    - name: Generate Fernet key fallback (openssl)
+      ansible.builtin.shell: |
+        openssl rand -base64 32
+      register: fernet_key_fallback
+      changed_when: false
+      when: not fernet_file.stat.exists and (fernet_key_gen is failed or fernet_key_gen is skipped)
+
+    # =========================================================================
+    # DIRECTORY SETUP
+    # =========================================================================
+    - name: Create Airflow directory structure
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ lakehouse_user }}"
+        mode: "0755"
+      loop:
+        - "{{ airflow_dir }}"
+        - "{{ airflow_dir }}/dags"
+        - "{{ airflow_dir }}/logs"
+        - "{{ airflow_dir }}/plugins"
+        - "{{ airflow_dir }}/config"
+
+    - name: Ensure Airflow directories are writable (uid 50000)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        mode: "0777"
+        state: directory
+      loop:
+        - "{{ airflow_dir }}/dags"
+        - "{{ airflow_dir }}/logs"
+        - "{{ airflow_dir }}/plugins"
+
+    - name: Save Fernet key to file
+      ansible.builtin.copy:
+        dest: "{{ airflow_dir }}/.fernet_key"
+        content: "{{ fernet_key_gen.stdout | default(fernet_key_fallback.stdout | default('CHANGE_ME_GENERATE_A_REAL_FERNET_KEY')) }}"
+        owner: "{{ lakehouse_user }}"
+        mode: "0600"
+      when: not fernet_file.stat.exists
+
+    - name: Read Fernet key from file
+      ansible.builtin.slurp:
+        src: "{{ airflow_dir }}/.fernet_key"
+      register: fernet_key_content
+
+    - name: Set Fernet key fact
+      ansible.builtin.set_fact:
+        airflow_fernet_key: "{{ fernet_key_content.content | b64decode | trim }}"
+
+    # =========================================================================
+    # SAMPLE DAG
+    # =========================================================================
+    - name: Write sample DAG for testing
+      ansible.builtin.copy:
+        dest: "{{ airflow_dir }}/dags/lakehouse_hello.py"
+        owner: "{{ lakehouse_user }}"
+        mode: "0644"
+        content: |
+          """
+          Lakehouse Platform - Sample DAG
+          Verifies Airflow is working correctly.
+          """
+          from datetime import datetime, timedelta
+          from airflow import DAG
+          from airflow.operators.bash import BashOperator
+          from airflow.operators.python import PythonOperator
+
+          default_args = {
+              'owner': 'lakehouse',
+              'depends_on_past': False,
+              'email_on_failure': False,
+              'email_on_retry': False,
+              'retries': 1,
+              'retry_delay': timedelta(minutes=5),
+          }
+
+          def check_platform():
+              """Check platform connectivity."""
+              import subprocess
+              result = subprocess.run(
+                  ['echo', 'Lakehouse Airflow is running!'],
+                  capture_output=True, text=True
+              )
+              print(result.stdout)
+              return 'Platform check passed'
+
+          with DAG(
+              'lakehouse_hello',
+              default_args=default_args,
+              description='Lakehouse platform health check DAG',
+              schedule_interval=timedelta(hours=1),
+              start_date=datetime(2024, 1, 1),
+              catchup=False,
+              tags=['lakehouse', 'health'],
+          ) as dag:
+
+              hello = BashOperator(
+                  task_id='hello_lakehouse',
+                  bash_command='echo "Hello from Lakehouse Airflow at $(date)"',
+              )
+
+              check = PythonOperator(
+                  task_id='check_platform',
+                  python_callable=check_platform,
+              )
+
+              hello >> check
+
+    # =========================================================================
+    # COMPOSE FILE
+    # =========================================================================
+    - name: Write Airflow compose.yaml
+      ansible.builtin.copy:
+        dest: "{{ airflow_dir }}/compose.yaml"
+        owner: "{{ lakehouse_user }}"
+        mode: "0644"
+        content: |
+          version: "3.9"
+
+          x-airflow-common: &airflow-common
+            image: {{ airflow_image }}
+            environment: &airflow-env
+              - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://{{ postgres_user }}:{{ postgres_password }}@{{ postgres_host }}:{{ postgres_port }}/{{ postgres_db }}
+              - AIRFLOW__CORE__EXECUTOR={{ airflow_executor }}
+              - AIRFLOW__CORE__FERNET_KEY={{ airflow_fernet_key }}
+              - AIRFLOW__CORE__LOAD_EXAMPLES=false
+              - AIRFLOW__WEBSERVER__EXPOSE_CONFIG=true
+              - AIRFLOW__WEBSERVER__RBAC=true
+            volumes: &airflow-volumes
+              - ./dags:/opt/airflow/dags
+              - ./logs:/opt/airflow/logs
+              - ./plugins:/opt/airflow/plugins
+
+          services:
+            airflow-init:
+              <<: *airflow-common
+              container_name: {{ airflow_init_container }}
+              entrypoint: /bin/bash
+              command: >
+                -c "
+                  airflow db migrate &&
+                  airflow users create
+                    --username {{ airflow_admin_user }}
+                    --password {{ airflow_admin_password }}
+                    --firstname Admin
+                    --lastname User
+                    --role Admin
+                    --email {{ airflow_admin_email }} || true
+                "
+              restart: "no"
+
+            airflow-webserver:
+              <<: *airflow-common
+              container_name: {{ airflow_webserver_container }}
+              ports:
+                - "{{ airflow_port }}:8080"
+              command: webserver
+              depends_on:
+                - airflow-init
+              restart: unless-stopped
+              healthcheck:
+                test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+                interval: 30s
+                timeout: 10s
+                retries: 5
+
+            airflow-scheduler:
+              <<: *airflow-common
+              container_name: {{ airflow_scheduler_container }}
+              command: scheduler
+              depends_on:
+                - airflow-init
+              restart: unless-stopped
+              healthcheck:
+                test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname $(hostname) || exit 1"]
+                interval: 30s
+                timeout: 10s
+                retries: 5
+
+          networks:
+            default:
+              external: true
+              name: {{ shared_network }}
+
+    # =========================================================================
+    # CONTAINER DEPLOYMENT
+    # =========================================================================
+    - name: Check if Airflow webserver container exists
+      become: false
+      ansible.builtin.command: nerdctl inspect {{ airflow_webserver_container }}
+      register: airflow_container_check
+      changed_when: false
+      failed_when: false
+
+    - name: Stop existing Airflow containers (for idempotency)
+      become: false
+      ansible.builtin.command: nerdctl compose -f compose.yaml down
+      args:
+        chdir: "{{ airflow_dir }}"
+      when: airflow_container_check.rc == 0
+      changed_when: true
+      failed_when: false
+
+    - name: Pull Airflow image
+      become: false
+      ansible.builtin.command: nerdctl pull {{ airflow_image }}
+      changed_when: false
+      failed_when: false
+
+    - name: Deploy Airflow with nerdctl compose
+      become: false
+      ansible.builtin.command: nerdctl compose -f compose.yaml up -d
+      args:
+        chdir: "{{ airflow_dir }}"
+      register: compose_result
+      changed_when: true
+
+    # =========================================================================
+    # POST-DEPLOYMENT VERIFICATION
+    # =========================================================================
+    - name: Wait for Airflow init to complete (DB migration)
+      ansible.builtin.pause:
+        seconds: 30
+
+    - name: Wait for Airflow webserver to be ready
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ airflow_port }}"
+        timeout: 120
+        state: started
+
+    - name: Verify Airflow webserver responds
+      ansible.builtin.uri:
+        url: "http://localhost:{{ airflow_port }}/health"
+        method: GET
+        status_code: [200]
+      register: airflow_health
+      retries: 10
+      delay: 10
+      until: airflow_health.status == 200
+      failed_when: false
+
+    - name: Show Airflow deployment info
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          Apache Airflow deployed successfully!
+          ============================================
+
+          Web UI:       http://localhost:{{ airflow_port }}
+          Username:     {{ airflow_admin_user }}
+          Password:     {{ airflow_admin_password }}
+
+          Executor:     {{ airflow_executor }}
+          Database:     {{ postgres_host }}:{{ postgres_port }}/{{ postgres_db }}
+
+          DAGs dir:     {{ airflow_dir }}/dags
+          Logs dir:     {{ airflow_dir }}/logs
+          Plugins dir:  {{ airflow_dir }}/plugins
+
+          Sample DAG:   lakehouse_hello (should appear in UI)
+
+          Fernet key stored in: {{ airflow_dir }}/.fernet_key
+
+          ============================================

@@ -1,0 +1,212 @@
+---
+# =============================================================================
+# Project Nessie - Git-like Data Catalog
+# =============================================================================
+# Playbook: 260206_nessie-catalog_rb_v1_0.yaml
+# Purpose:  Deploy Nessie as a versioned data catalog (Iceberg/Delta tables)
+# Depends:  seaweedfs_default network, Shared Services (PostgreSQL)
+# Deploy:   ansible-playbook 260206_nessie-catalog_rb_v1_0.yaml
+# Access:   http://localhost:19120/api/v1/trees
+# =============================================================================
+
+- name: Deploy Project Nessie Catalog
+  hosts: localhost
+  connection: local
+  become: true
+
+  vars:
+    nessie_dir: /opt/lakehouse/nessie
+    lakehouse_user: "{{ ansible_env.SUDO_USER | default(ansible_user_id) }}"
+    shared_network: "seaweedfs_default"
+
+    # Nessie configuration
+    nessie_image: "projectnessie/nessie:0.76.0"
+    nessie_container: "nessie"
+    nessie_port: 19120
+
+    # PostgreSQL backend (from shared services)
+    postgres_container: "lakehouse-postgres"
+    postgres_host: "lakehouse-postgres"
+    postgres_port: 5432
+    postgres_db: "nessie"
+    postgres_user: "lakehouse"
+    postgres_password: "lakehouse"
+
+  tasks:
+    # =========================================================================
+    # PRE-FLIGHT CHECKS
+    # =========================================================================
+    - name: Pre-flight - Verify nerdctl is available
+      become: false
+      ansible.builtin.command: nerdctl --version
+      changed_when: false
+
+    - name: Pre-flight - Verify shared network exists
+      become: false
+      ansible.builtin.command: nerdctl network inspect {{ shared_network }}
+      register: net_check
+      changed_when: false
+      failed_when: false
+
+    - name: Pre-flight - Fail if network missing
+      ansible.builtin.fail:
+        msg: "FATAL: Network '{{ shared_network }}' not found."
+      when: net_check.rc != 0
+
+    - name: Pre-flight - Verify PostgreSQL is running
+      become: false
+      ansible.builtin.command: nerdctl inspect {{ postgres_container }}
+      register: pg_check
+      changed_when: false
+      failed_when: false
+
+    - name: Pre-flight - Fail if PostgreSQL not running
+      ansible.builtin.fail:
+        msg: >
+          FATAL: PostgreSQL container '{{ postgres_container }}' not found.
+          Deploy shared services first:
+          ansible-playbook 260206_shared-services_rb_v1_0.yaml
+      when: pg_check.rc != 0
+
+    - name: Pre-flight - Verify nessie database exists
+      become: false
+      ansible.builtin.command: >
+        nerdctl exec {{ postgres_container }}
+        psql -U {{ postgres_user }} -d {{ postgres_db }} -c "SELECT 1;"
+      register: db_check
+      changed_when: false
+      failed_when: false
+
+    - name: Pre-flight - Warn if nessie database missing
+      ansible.builtin.debug:
+        msg: "WARNING: Nessie database may not exist yet. Nessie will attempt to create tables on startup."
+      when: db_check.rc != 0
+
+    # =========================================================================
+    # DIRECTORY SETUP
+    # =========================================================================
+    - name: Create Nessie directory
+      ansible.builtin.file:
+        path: "{{ nessie_dir }}"
+        state: directory
+        owner: "{{ lakehouse_user }}"
+        mode: "0755"
+
+    # =========================================================================
+    # COMPOSE FILE
+    # =========================================================================
+    - name: Write Nessie compose.yaml
+      ansible.builtin.copy:
+        dest: "{{ nessie_dir }}/compose.yaml"
+        owner: "{{ lakehouse_user }}"
+        mode: "0644"
+        content: |
+          version: "3.9"
+
+          services:
+            nessie:
+              image: {{ nessie_image }}
+              container_name: {{ nessie_container }}
+              environment:
+                # PostgreSQL JDBC backend
+                - QUARKUS_DATASOURCE_JDBC_URL=jdbc:postgresql://{{ postgres_host }}:{{ postgres_port }}/{{ postgres_db }}
+                - QUARKUS_DATASOURCE_USERNAME={{ postgres_user }}
+                - QUARKUS_DATASOURCE_PASSWORD={{ postgres_password }}
+                - NESSIE_VERSION_STORE_TYPE=JDBC
+
+                # REST API configuration
+                - QUARKUS_HTTP_PORT={{ nessie_port }}
+                - QUARKUS_HTTP_HOST=0.0.0.0
+
+                # CORS (for web UI and cross-service access)
+                - QUARKUS_HTTP_CORS=true
+                - QUARKUS_HTTP_CORS_ORIGINS=*
+
+                # JVM memory (lightweight)
+                - JAVA_OPTS_APPEND=-Xms64m -Xmx256m
+              ports:
+                - "{{ nessie_port }}:{{ nessie_port }}"
+              restart: unless-stopped
+
+          networks:
+            default:
+              external: true
+              name: {{ shared_network }}
+
+    # =========================================================================
+    # CONTAINER DEPLOYMENT
+    # =========================================================================
+    - name: Check if Nessie container exists
+      become: false
+      ansible.builtin.command: nerdctl inspect {{ nessie_container }}
+      register: nessie_container_check
+      changed_when: false
+      failed_when: false
+
+    - name: Stop existing Nessie container (for idempotency)
+      become: false
+      ansible.builtin.command: nerdctl compose -f compose.yaml down
+      args:
+        chdir: "{{ nessie_dir }}"
+      when: nessie_container_check.rc == 0
+      changed_when: true
+      failed_when: false
+
+    - name: Pull Nessie image
+      become: false
+      ansible.builtin.command: nerdctl pull {{ nessie_image }}
+      changed_when: false
+      failed_when: false
+
+    - name: Deploy Nessie with nerdctl compose
+      become: false
+      ansible.builtin.command: nerdctl compose -f compose.yaml up -d
+      args:
+        chdir: "{{ nessie_dir }}"
+      register: compose_result
+      changed_when: true
+
+    # =========================================================================
+    # POST-DEPLOYMENT VERIFICATION
+    # =========================================================================
+    - name: Wait for Nessie to be ready
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ nessie_port }}"
+        timeout: 60
+        state: started
+
+    - name: Verify Nessie API is responding
+      ansible.builtin.uri:
+        url: "http://localhost:{{ nessie_port }}/api/v1/trees"
+        method: GET
+        status_code: 200
+      register: nessie_health
+      retries: 10
+      delay: 5
+      until: nessie_health.status == 200
+
+    - name: Show Nessie deployment info
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          Project Nessie deployed successfully!
+          ============================================
+
+          REST API:     http://localhost:{{ nessie_port }}/api/v1
+          Trees API:    http://localhost:{{ nessie_port }}/api/v1/trees
+          Backend:      PostgreSQL ({{ postgres_host }}:{{ postgres_port }}/{{ postgres_db }})
+
+          Spark Integration:
+            spark.sql.catalog.nessie=org.apache.iceberg.spark.SparkCatalog
+            spark.sql.catalog.nessie.catalog-impl=org.apache.iceberg.nessie.NessieCatalog
+            spark.sql.catalog.nessie.uri=http://nessie:{{ nessie_port }}/api/v1
+            spark.sql.catalog.nessie.ref=main
+            spark.sql.catalog.nessie.warehouse=s3a://lakehouse/warehouse/
+
+          Trino Integration:
+            iceberg.catalog.type=nessie
+            iceberg.nessie.uri=http://nessie:{{ nessie_port }}/api/v1
+            iceberg.nessie.ref=main
+
+          ============================================

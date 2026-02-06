@@ -1,0 +1,344 @@
+---
+# =============================================================================
+# Apache Superset - Business Intelligence & Visualization
+# =============================================================================
+# Playbook: 260206_superset-bi_rb_v1_0.yaml
+# Purpose:  Deploy Superset for self-service BI dashboards
+# Depends:  seaweedfs_default network, Shared Services (PostgreSQL + Redis)
+# Deploy:   ansible-playbook 260206_superset-bi_rb_v1_0.yaml
+# Access:   http://localhost:8088 (admin/admin)
+# =============================================================================
+
+- name: Deploy Apache Superset
+  hosts: localhost
+  connection: local
+  become: true
+
+  vars:
+    superset_dir: /opt/lakehouse/superset
+    lakehouse_user: "{{ ansible_env.SUDO_USER | default(ansible_user_id) }}"
+    shared_network: "seaweedfs_default"
+
+    # Superset configuration
+    superset_image: "apache/superset:3.0.3"
+    superset_port: 8088
+
+    # Container names
+    superset_init_container: "superset-init"
+    superset_container: "superset"
+
+    # Database (shared PostgreSQL)
+    postgres_container: "lakehouse-postgres"
+    postgres_host: "lakehouse-postgres"
+    postgres_port: 5432
+    postgres_db: "superset"
+    postgres_user: "lakehouse"
+    postgres_password: "lakehouse"
+
+    # Redis (shared)
+    redis_container: "lakehouse-redis"
+    redis_host: "lakehouse-redis"
+    redis_port: 6379
+
+    # Admin credentials
+    superset_admin_user: "admin"
+    superset_admin_password: "admin"
+    superset_admin_email: "admin@lakehouse.local"
+
+  tasks:
+    # =========================================================================
+    # PRE-FLIGHT CHECKS
+    # =========================================================================
+    - name: Pre-flight - Verify nerdctl is available
+      become: false
+      ansible.builtin.command: nerdctl --version
+      changed_when: false
+
+    - name: Pre-flight - Verify shared network exists
+      become: false
+      ansible.builtin.command: nerdctl network inspect {{ shared_network }}
+      register: net_check
+      changed_when: false
+      failed_when: false
+
+    - name: Pre-flight - Fail if network missing
+      ansible.builtin.fail:
+        msg: "FATAL: Network '{{ shared_network }}' not found."
+      when: net_check.rc != 0
+
+    - name: Pre-flight - Verify PostgreSQL is running
+      become: false
+      ansible.builtin.command: nerdctl inspect {{ postgres_container }}
+      register: pg_check
+      changed_when: false
+      failed_when: false
+
+    - name: Pre-flight - Fail if PostgreSQL not running
+      ansible.builtin.fail:
+        msg: >
+          FATAL: PostgreSQL container '{{ postgres_container }}' not found.
+          Deploy shared services first.
+      when: pg_check.rc != 0
+
+    - name: Pre-flight - Verify Redis is running
+      become: false
+      ansible.builtin.command: nerdctl inspect {{ redis_container }}
+      register: redis_check
+      changed_when: false
+      failed_when: false
+
+    - name: Pre-flight - Fail if Redis not running
+      ansible.builtin.fail:
+        msg: >
+          FATAL: Redis container '{{ redis_container }}' not found.
+          Deploy shared services first.
+      when: redis_check.rc != 0
+
+    # =========================================================================
+    # GENERATE SECRET KEY
+    # =========================================================================
+    - name: Check for existing secret key
+      ansible.builtin.stat:
+        path: "{{ superset_dir }}/.secret_key"
+      register: secret_file
+
+    - name: Generate secret key for Superset
+      ansible.builtin.shell: |
+        python3 -c "import secrets; print(secrets.token_urlsafe(42))"
+      register: secret_key_gen
+      changed_when: false
+      when: not secret_file.stat.exists
+      failed_when: false
+
+    - name: Generate secret key fallback (openssl)
+      ansible.builtin.shell: |
+        openssl rand -base64 42
+      register: secret_key_fallback
+      changed_when: false
+      when: not secret_file.stat.exists and (secret_key_gen is failed or secret_key_gen is skipped)
+
+    # =========================================================================
+    # DIRECTORY SETUP
+    # =========================================================================
+    - name: Create Superset directory structure
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ lakehouse_user }}"
+        mode: "0755"
+      loop:
+        - "{{ superset_dir }}"
+        - "{{ superset_dir }}/config"
+
+    - name: Save secret key to file
+      ansible.builtin.copy:
+        dest: "{{ superset_dir }}/.secret_key"
+        content: "{{ secret_key_gen.stdout | default(secret_key_fallback.stdout | default('CHANGE_ME_IN_PRODUCTION_USE_REAL_SECRET')) }}"
+        owner: "{{ lakehouse_user }}"
+        mode: "0600"
+      when: not secret_file.stat.exists
+
+    - name: Read secret key from file
+      ansible.builtin.slurp:
+        src: "{{ superset_dir }}/.secret_key"
+      register: secret_key_content
+
+    - name: Set secret key fact
+      ansible.builtin.set_fact:
+        superset_secret_key: "{{ secret_key_content.content | b64decode | trim }}"
+
+    # =========================================================================
+    # SUPERSET CONFIG
+    # =========================================================================
+    - name: Write Superset configuration (superset_config.py)
+      ansible.builtin.copy:
+        dest: "{{ superset_dir }}/config/superset_config.py"
+        owner: "{{ lakehouse_user }}"
+        mode: "0644"
+        content: |
+          import os
+
+          # Security
+          SECRET_KEY = os.environ.get('SUPERSET_SECRET_KEY', '{{ superset_secret_key }}')
+
+          # PostgreSQL database
+          SQLALCHEMY_DATABASE_URI = (
+              'postgresql+psycopg2://{{ postgres_user }}:{{ postgres_password }}'
+              '@{{ postgres_host }}:{{ postgres_port }}/{{ postgres_db }}'
+          )
+
+          # Redis cache
+          CACHE_CONFIG = {
+              'CACHE_TYPE': 'redis',
+              'CACHE_DEFAULT_TIMEOUT': 300,
+              'CACHE_KEY_PREFIX': 'superset_',
+              'CACHE_REDIS_HOST': '{{ redis_host }}',
+              'CACHE_REDIS_PORT': {{ redis_port }},
+              'CACHE_REDIS_DB': 1,
+          }
+
+          # Celery (using Redis)
+          class CeleryConfig:
+              broker_url = 'redis://{{ redis_host }}:{{ redis_port }}/0'
+              result_backend = 'redis://{{ redis_host }}:{{ redis_port }}/0'
+
+          CELERY_CONFIG = CeleryConfig
+
+          # Feature flags
+          FEATURE_FLAGS = {
+              'ENABLE_TEMPLATE_PROCESSING': True,
+          }
+
+          # Row limit
+          ROW_LIMIT = 50000
+          SUPERSET_WEBSERVER_PORT = 8088
+
+    # =========================================================================
+    # COMPOSE FILE
+    # =========================================================================
+    - name: Write Superset compose.yaml
+      ansible.builtin.copy:
+        dest: "{{ superset_dir }}/compose.yaml"
+        owner: "{{ lakehouse_user }}"
+        mode: "0644"
+        content: |
+          version: "3.9"
+
+          x-superset-common: &superset-common
+            image: {{ superset_image }}
+            environment: &superset-env
+              - SUPERSET_SECRET_KEY={{ superset_secret_key }}
+              - SUPERSET_CONFIG_PATH=/app/superset_config.py
+              - DATABASE_DB={{ postgres_db }}
+              - DATABASE_HOST={{ postgres_host }}
+              - DATABASE_PASSWORD={{ postgres_password }}
+              - DATABASE_USER={{ postgres_user }}
+              - DATABASE_PORT={{ postgres_port }}
+              - DATABASE_DIALECT=postgresql
+              - REDIS_HOST={{ redis_host }}
+              - REDIS_PORT={{ redis_port }}
+            volumes: &superset-volumes
+              - ./config/superset_config.py:/app/superset_config.py:ro
+
+          services:
+            superset-init:
+              <<: *superset-common
+              container_name: {{ superset_init_container }}
+              command: >
+                bash -c "
+                  superset db upgrade &&
+                  superset fab create-admin
+                    --username {{ superset_admin_user }}
+                    --firstname Admin
+                    --lastname User
+                    --email {{ superset_admin_email }}
+                    --password {{ superset_admin_password }} &&
+                  superset init
+                "
+              restart: "no"
+
+            superset:
+              <<: *superset-common
+              container_name: {{ superset_container }}
+              ports:
+                - "{{ superset_port }}:8088"
+              command: >
+                bash -c "
+                  superset db upgrade &&
+                  gunicorn
+                    --bind 0.0.0.0:8088
+                    --access-logfile -
+                    --error-logfile -
+                    --workers 2
+                    --timeout 120
+                    'superset.app:create_app()'
+                "
+              depends_on:
+                - superset-init
+              restart: unless-stopped
+
+          networks:
+            default:
+              external: true
+              name: {{ shared_network }}
+
+    # =========================================================================
+    # CONTAINER DEPLOYMENT
+    # =========================================================================
+    - name: Check if Superset container exists
+      become: false
+      ansible.builtin.command: nerdctl inspect {{ superset_container }}
+      register: superset_container_check
+      changed_when: false
+      failed_when: false
+
+    - name: Stop existing Superset containers (for idempotency)
+      become: false
+      ansible.builtin.command: nerdctl compose -f compose.yaml down
+      args:
+        chdir: "{{ superset_dir }}"
+      when: superset_container_check.rc == 0
+      changed_when: true
+      failed_when: false
+
+    - name: Pull Superset image
+      become: false
+      ansible.builtin.command: nerdctl pull {{ superset_image }}
+      changed_when: false
+      failed_when: false
+
+    - name: Deploy Superset with nerdctl compose
+      become: false
+      ansible.builtin.command: nerdctl compose -f compose.yaml up -d
+      args:
+        chdir: "{{ superset_dir }}"
+      register: compose_result
+      changed_when: true
+
+    # =========================================================================
+    # POST-DEPLOYMENT VERIFICATION
+    # =========================================================================
+    - name: Wait for Superset init to complete
+      ansible.builtin.pause:
+        seconds: 45
+
+    - name: Wait for Superset to be ready
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ superset_port }}"
+        timeout: 120
+        state: started
+
+    - name: Verify Superset responds
+      ansible.builtin.uri:
+        url: "http://localhost:{{ superset_port }}/health"
+        method: GET
+        status_code: [200]
+      register: superset_health
+      retries: 10
+      delay: 10
+      until: superset_health.status == 200
+      failed_when: false
+
+    - name: Show Superset deployment info
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          Apache Superset deployed successfully!
+          ============================================
+
+          Web UI:       http://localhost:{{ superset_port }}
+          Username:     {{ superset_admin_user }}
+          Password:     {{ superset_admin_password }}
+
+          Database:     {{ postgres_host }}:{{ postgres_port }}/{{ postgres_db }}
+          Cache:        {{ redis_host }}:{{ redis_port }}
+
+          Config:       {{ superset_dir }}/config/superset_config.py
+          Secret key:   {{ superset_dir }}/.secret_key
+
+          Pre-configured data sources:
+            Add Databend:  mysql://databend:databend@databend:3307
+            Add Trino:     trino://trino:8080/iceberg
+
+          ============================================

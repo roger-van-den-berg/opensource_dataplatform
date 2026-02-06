@@ -1,0 +1,197 @@
+---
+# =============================================================================
+# Master Deployment Playbook - Full Lakehouse Platform
+# =============================================================================
+# Playbook: 260206_deploy_all_lakehouse_rb_v1_0.yaml
+# Purpose:  Deploy the complete lakehouse platform in phased order
+# Deploy:   ansible-playbook 260206_deploy_all_lakehouse_rb_v1_0.yaml
+# Note:     Assumes SeaweedFS + Databend are already deployed
+# =============================================================================
+
+- name: Deploy Full Lakehouse Platform
+  hosts: localhost
+  connection: local
+  become: true
+
+  vars:
+    lakehouse_user: "{{ ansible_env.SUDO_USER | default(ansible_user_id) }}"
+    ansible_dir: /opt/lakehouse/ansible
+    deploy_phase_2: false  # Set to true for full stack
+
+  tasks:
+    # =========================================================================
+    # PRE-FLIGHT: SYSTEM CHECKS
+    # =========================================================================
+    - name: Pre-flight - Check available memory
+      ansible.builtin.shell: free -m | awk '/^Mem:/{print $7}'
+      register: available_memory
+      changed_when: false
+
+    - name: Pre-flight - Show system resources
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          SYSTEM RESOURCE CHECK
+          ============================================
+          Available memory: {{ available_memory.stdout }}MB
+
+          Memory requirements:
+            Phase 0+1 (Core):     ~2.5GB
+            Full Stack (All):     ~4.0GB
+
+          Deploy Phase 2: {{ deploy_phase_2 }}
+          ============================================
+
+    - name: Pre-flight - Warn if low memory
+      ansible.builtin.debug:
+        msg: >
+          WARNING: Available memory ({{ available_memory.stdout }}MB) is below
+          recommended 4096MB. Full stack deployment may cause OOM issues.
+          Consider deploying Phase 0+1 only.
+      when: available_memory.stdout | int < 4096
+
+    - name: Pre-flight - Verify nerdctl is available
+      become: false
+      ansible.builtin.command: nerdctl --version
+      register: nerdctl_ver
+      changed_when: false
+
+    - name: Pre-flight - Verify shared network exists
+      become: false
+      ansible.builtin.command: nerdctl network inspect seaweedfs_default
+      register: net_check
+      changed_when: false
+      failed_when: false
+
+    - name: Pre-flight - Fail if network missing
+      ansible.builtin.fail:
+        msg: >
+          FATAL: seaweedfs_default network not found.
+          Deploy SeaweedFS infrastructure first.
+      when: net_check.rc != 0
+
+    # =========================================================================
+    # PHASE 0: PORTAL & SHARED SERVICES
+    # =========================================================================
+    - name: "=== PHASE 0: Portal & Shared Services ==="
+      ansible.builtin.debug:
+        msg: "Deploying Phase 0: Homer Dashboard + Shared Services (PostgreSQL + Redis)"
+
+    - name: Deploy Homer Dashboard
+      ansible.builtin.include_tasks:
+        file: 260206_homer-dashboard_rb_v1_0.yaml
+        apply:
+          tags: [phase0, homer]
+
+    - name: Deploy Shared Services
+      ansible.builtin.include_tasks:
+        file: 260206_shared-services_rb_v1_0.yaml
+        apply:
+          tags: [phase0, shared-services]
+
+    - name: Phase 0 complete
+      ansible.builtin.debug:
+        msg: "Phase 0 deployed: Homer (8090), PostgreSQL (5432), Redis (6379)"
+
+    # =========================================================================
+    # PHASE 1: CORE DATA PLATFORM
+    # =========================================================================
+    - name: "=== PHASE 1: Core Data Platform ==="
+      ansible.builtin.debug:
+        msg: "Deploying Phase 1: Spark + Nessie + JupyterLab"
+
+    - name: Deploy Spark + Thrift Server
+      ansible.builtin.include_tasks:
+        file: 260206_spark-thrift_rb_v1_0.yaml
+        apply:
+          tags: [phase1, spark]
+
+    - name: Deploy Nessie Catalog
+      ansible.builtin.include_tasks:
+        file: 260206_nessie-catalog_rb_v1_0.yaml
+        apply:
+          tags: [phase1, nessie]
+
+    - name: Deploy JupyterLab
+      ansible.builtin.include_tasks:
+        file: 260206_jupyter-pyspark_rb_v1_0.yaml
+        apply:
+          tags: [phase1, jupyter]
+
+    - name: Phase 1 complete
+      ansible.builtin.debug:
+        msg: "Phase 1 deployed: Spark (8081), Nessie (19120), Jupyter (8889)"
+
+    # =========================================================================
+    # PHASE 2: EXTENDED PLATFORM (OPTIONAL)
+    # =========================================================================
+    - name: "=== PHASE 2: Extended Platform ==="
+      ansible.builtin.debug:
+        msg: "Deploying Phase 2: Trino + Airflow + Superset"
+      when: deploy_phase_2 | bool
+
+    - name: Deploy Trino
+      ansible.builtin.include_tasks:
+        file: 260206_trino-sql_rb_v1_0.yaml
+        apply:
+          tags: [phase2, trino]
+      when: deploy_phase_2 | bool
+
+    - name: Deploy Airflow
+      ansible.builtin.include_tasks:
+        file: 260206_airflow-orchestration_rb_v1_0.yaml
+        apply:
+          tags: [phase2, airflow]
+      when: deploy_phase_2 | bool
+
+    - name: Deploy Superset
+      ansible.builtin.include_tasks:
+        file: 260206_superset-bi_rb_v1_0.yaml
+        apply:
+          tags: [phase2, superset]
+      when: deploy_phase_2 | bool
+
+    # =========================================================================
+    # FINAL SUMMARY
+    # =========================================================================
+    - name: Show final deployment summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          LAKEHOUSE PLATFORM DEPLOYED
+          ============================================
+
+          Portal Dashboard: http://localhost:8090
+
+          Core Services (Phase 0+1):
+            Homer Dashboard:     http://localhost:8090
+            PostgreSQL:          localhost:5432 (lakehouse/lakehouse)
+            Redis:               localhost:6379
+            Spark Master UI:     http://localhost:8081
+            Spark Worker UI:     http://localhost:8082
+            Spark Thrift:        jdbc:hive2://localhost:10000
+            Spark History:       http://localhost:18080
+            Nessie Catalog:      http://localhost:19120/api/v1/trees
+            JupyterLab:          http://localhost:8889 (token: lakehouse)
+
+          Extended Services (Phase 2):
+          {% if deploy_phase_2 | bool %}
+            Trino:               http://localhost:8085
+            Airflow:             http://localhost:8086 (admin/admin)
+            Superset:            http://localhost:8088 (admin/admin)
+          {% else %}
+            (not deployed - set deploy_phase_2=true)
+          {% endif %}
+
+          Existing Services (pre-deployed):
+            SeaweedFS Master:    http://localhost:9333
+            SeaweedFS S3:        http://localhost:8333
+            Databend UI:         http://localhost:28080
+
+          Next Steps:
+            1. Visit Homer Dashboard for all links
+            2. Test S3: aws s3 ls --endpoint-url http://localhost:8333
+            3. Open JupyterLab and run starter notebook
+            4. Create Iceberg tables via Spark or Trino
+
+          ============================================

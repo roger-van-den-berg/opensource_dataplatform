@@ -21,7 +21,7 @@
     shared_network: "seaweedfs_default"
 
     # Image and version
-    spark_image: "bitnami/spark:3.5.0"
+    spark_image: "bitnami/spark:3.5"
 
     # Container names
     spark_master_container: "spark-master"
@@ -123,8 +123,6 @@
         owner: "{{ lakehouse_user }}"
         mode: "0644"
         content: |
-          version: "3.9"
-
           services:
             spark-master:
               image: {{ spark_image }}

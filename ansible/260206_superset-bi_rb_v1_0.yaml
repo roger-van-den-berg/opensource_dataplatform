@@ -224,15 +224,18 @@
             superset-init:
               <<: *superset-common
               container_name: {{ superset_init_container }}
-              command: >
-                bash -c "superset db upgrade &&
-                         (superset fab create-admin
-                           --username {{ superset_admin_user }}
-                           --firstname Admin
-                           --lastname User
-                           --email {{ superset_admin_email }}
-                           --password {{ superset_admin_password }} || true) &&
-                         superset init"
+              command:
+                - bash
+                - -lc
+                - |
+                  superset db upgrade
+                  superset fab create-admin \
+                    --username {{ superset_admin_user }} \
+                    --firstname Admin \
+                    --lastname User \
+                    --email {{ superset_admin_email }} \
+                    --password {{ superset_admin_password }} || true
+                  superset init
               restart: "no"
 
             superset:
@@ -240,11 +243,19 @@
               container_name: {{ superset_container }}
               ports:
                 - "{{ superset_port }}:8088"
-              command: >
-                bash -c "exec gunicorn --bind 0.0.0.0:8088
-                         --access-logfile - --error-logfile -
-                         --workers 2 --timeout 120
-                         'superset.app:create_app()'"
+              command:
+                - gunicorn
+                - --bind
+                - 0.0.0.0:8088
+                - --access-logfile
+                - "-"
+                - --error-logfile
+                - "-"
+                - --workers
+                - "2"
+                - --timeout
+                - "120"
+                - superset.app:create_app()
               depends_on:
                 - superset-init
               restart: unless-stopped
@@ -287,7 +298,6 @@
       register: compose_result
       changed_when: true
 
-    # Helpful immediate logs (even if compose succeeded, init can still fail)
     - name: Show superset-init logs (tail)
       become: false
       ansible.builtin.command: nerdctl logs --tail=120 {{ superset_init_container }}
@@ -345,9 +355,4 @@
 
           Config:       {{ superset_dir }}/config/superset_config.py
           Secret key:   {{ superset_dir }}/.secret_key
-
-          Pre-configured data sources:
-            Add Databend:  mysql://databend:databend@databend:3307
-            Add Trino:     trino://trino:8080/iceberg
-
           ============================================

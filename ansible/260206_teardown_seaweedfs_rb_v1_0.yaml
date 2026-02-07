@@ -1,0 +1,130 @@
+---
+# =============================================================================
+# Teardown Playbook - Remove SeaweedFS Storage Cluster
+# =============================================================================
+# Playbook: 260206_teardown_seaweedfs_rb_v1_0.yaml
+# Purpose:  Stop and remove SeaweedFS containers (preserves data by default)
+# Deploy:   ansible-playbook 260206_teardown_seaweedfs_rb_v1_0.yaml
+# Data:     ansible-playbook 260206_teardown_seaweedfs_rb_v1_0.yaml -e delete_data=true
+#
+# WARNING:  All lakehouse services depend on SeaweedFS!
+#           Run teardown_lakehouse first, or services will lose S3 access.
+# =============================================================================
+
+- name: Teardown SeaweedFS Storage Cluster
+  hosts: localhost
+  connection: local
+  become: true
+
+  vars:
+    lakehouse_user: "{{ ansible_env.SUDO_USER | default(ansible_user_id) }}"
+    delete_data: false
+    seaweedfs_dir: /opt/lakehouse/seaweedfs
+
+    # Containers to remove (reverse dependency order)
+    containers:
+      - s3
+      - seaweedfs-filer
+      - seaweedfs-volume
+      - seaweedfs-master
+
+  tasks:
+    # =========================================================================
+    # WARNING CHECK
+    # =========================================================================
+    - name: "=== WARNING: SeaweedFS Teardown ==="
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          WARNING: Tearing down SeaweedFS!
+
+          All lakehouse services depend on SeaweedFS
+          for S3 storage. Ensure you have torn down
+          the lakehouse platform first:
+
+            ansible-playbook 260206_teardown_lakehouse_rb_v1_0.yaml
+
+          Data: {{ 'WILL BE DELETED' if delete_data | bool else 'will be PRESERVED' }}
+          ============================================
+
+    # =========================================================================
+    # GRACEFUL COMPOSE DOWN
+    # =========================================================================
+    - name: Check if SeaweedFS compose exists
+      ansible.builtin.stat:
+        path: "{{ seaweedfs_dir }}/compose.yaml"
+      register: compose_file
+
+    - name: Compose down for SeaweedFS
+      become: false
+      ansible.builtin.command: nerdctl compose -f compose.yaml down
+      args:
+        chdir: "{{ seaweedfs_dir }}"
+      when: compose_file.stat.exists
+      register: compose_down
+      failed_when: false
+      changed_when: compose_down.rc == 0
+
+    # =========================================================================
+    # FORCE REMOVE REMAINING CONTAINERS
+    # =========================================================================
+    - name: Force remove any remaining SeaweedFS containers
+      become: false
+      ansible.builtin.command: nerdctl rm -f {{ item }}
+      loop: "{{ containers }}"
+      register: container_removal
+      failed_when: false
+      changed_when: container_removal.rc == 0
+
+    # =========================================================================
+    # DATA CLEANUP (OPTIONAL)
+    # =========================================================================
+    - name: "=== Data Cleanup ==="
+      ansible.builtin.debug:
+        msg: |
+          {% if delete_data | bool %}
+          WARNING: Deleting all SeaweedFS data directories!
+          All stored objects will be permanently lost.
+          {% else %}
+          Data preserved in {{ seaweedfs_dir }}/
+          To delete data, rerun with: -e delete_data=true
+          {% endif %}
+
+    - name: Remove SeaweedFS data directories
+      ansible.builtin.file:
+        path: "{{ seaweedfs_dir }}"
+        state: absent
+      when: delete_data | bool
+
+    # =========================================================================
+    # VERIFICATION
+    # =========================================================================
+    - name: List remaining SeaweedFS containers
+      become: false
+      ansible.builtin.shell: |
+        nerdctl ps -a --format '{{ '{{' }}.Names{{ '}}' }}' 2>/dev/null | grep -E '(seaweedfs|^s3$)' || echo "none"
+      register: remaining_containers
+      changed_when: false
+
+    - name: Show teardown summary
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          SEAWEEDFS TEARDOWN COMPLETE
+          ============================================
+
+          Containers stopped and removed.
+          Remaining: {{ remaining_containers.stdout }}
+
+          Data: {{ 'DELETED' if delete_data | bool else 'PRESERVED in ' ~ seaweedfs_dir ~ '/' }}
+
+          Note: The seaweedfs_default network may still
+          exist if other containers are attached.
+
+          To redeploy:
+            ansible-playbook 260206_seaweedfs-storage_rb_v1_0.yaml
+
+          To delete data too:
+            ansible-playbook 260206_teardown_seaweedfs_rb_v1_0.yaml -e delete_data=true
+
+          ============================================

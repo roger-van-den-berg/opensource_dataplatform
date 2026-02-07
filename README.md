@@ -43,30 +43,48 @@ A fully integrated, production-ready open-source data lakehouse on WSL2/Ubuntu w
 - **WSL2 Ubuntu** with 4-8GB RAM allocated
 - **containerd + nerdctl** (no Docker)
 - **Ansible** installed
-- **SeaweedFS** deployed (provides `seaweedfs_default` network)
 - **Databend** deployed (optional, query engine)
 
 ## Quick Start
 
 ```bash
-# Deploy core platform (Phase 0+1, ~2.5GB RAM)
 cd ansible
+
+# Step 1: Deploy SeaweedFS storage (creates seaweedfs_default network)
+ansible-playbook 260206_seaweedfs-storage_rb_v1_0.yaml
+
+# Step 2: Deploy core platform (Phase 0+1, ~2.5GB RAM)
 ansible-playbook 260206_deploy_all_lakehouse_rb_v1_0.yaml
 
-# Deploy full stack including Trino, Airflow, Superset (~4GB RAM)
+# Step 3 (optional): Deploy full stack including Trino, Airflow, Superset (~4GB RAM)
 ansible-playbook 260206_deploy_all_lakehouse_rb_v1_0.yaml -e deploy_phase_2=true
 
 # Health check
 bash health_check.sh
 
-# Teardown (keep data)
+# Teardown lakehouse (keep data)
 ansible-playbook 260206_teardown_lakehouse_rb_v1_0.yaml
 
-# Teardown (delete data)
+# Teardown SeaweedFS (keep data)
+ansible-playbook 260206_teardown_seaweedfs_rb_v1_0.yaml
+
+# Teardown everything including data
 ansible-playbook 260206_teardown_lakehouse_rb_v1_0.yaml -e delete_data=true
+ansible-playbook 260206_teardown_seaweedfs_rb_v1_0.yaml -e delete_data=true
 ```
 
 ## Deployment Phases
+
+### Storage Layer: SeaweedFS (~200MB)
+
+| Component | Playbook | Port | Purpose |
+|-----------|----------|------|---------|
+| SeaweedFS Master | `260206_seaweedfs-storage_rb_v1_0.yaml` | 9333 | Cluster management |
+| SeaweedFS Volume | (same) | - | Data storage |
+| SeaweedFS Filer | (same) | 8888 | File system interface |
+| SeaweedFS S3 | (same) | 8333 | S3-compatible API |
+
+> Must be deployed first. Creates the `seaweedfs_default` network used by all other services.
 
 ### Phase 0: Portal & Shared Services (~250MB)
 
@@ -100,6 +118,9 @@ ansible-playbook 260206_teardown_lakehouse_rb_v1_0.yaml -e delete_data=true
 Each component can be deployed independently:
 
 ```bash
+# Storage Layer (must be first)
+ansible-playbook 260206_seaweedfs-storage_rb_v1_0.yaml
+
 # Phase 0
 ansible-playbook 260206_homer-dashboard_rb_v1_0.yaml
 ansible-playbook 260206_shared-services_rb_v1_0.yaml
@@ -159,6 +180,7 @@ All services connect to SeaweedFS S3 via the shared network:
 ## Component Dependencies
 
 ```
+SeaweedFS             → (none - deploy first)
 Homer Dashboard       → seaweedfs_default network
 Shared Services       → seaweedfs_default network
 Spark                 → seaweedfs_default network, SeaweedFS S3
@@ -173,6 +195,12 @@ Superset              → Shared Services (PostgreSQL + Redis)
 
 ```
 /opt/lakehouse/
+├── seaweedfs/              # SeaweedFS Storage
+│   ├── master-data/        # Master metadata
+│   ├── volume-data/        # Stored objects
+│   ├── filer-data/         # Filer metadata (leveldb)
+│   ├── s3.config.json      # S3 credentials config
+│   └── compose.yaml
 ├── homer/                  # Homer Dashboard
 │   ├── assets/config.yml   # Dashboard configuration
 │   └── compose.yaml

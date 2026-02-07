@@ -1,0 +1,376 @@
+---
+# =============================================================================
+# SeaweedFS - Distributed Storage with S3-Compatible API
+# =============================================================================
+# Playbook: 260206_seaweedfs-storage_rb_v1_0.yaml
+# Purpose:  Deploy SeaweedFS cluster (Master, Volume, Filer, S3 Gateway)
+# Network:  Creates seaweedfs_default network (used by all lakehouse services)
+# Deploy:   ansible-playbook 260206_seaweedfs-storage_rb_v1_0.yaml
+# Ports:    Master 9333, Filer 8888, S3 API 8333
+# Note:     Must be deployed BEFORE any lakehouse component
+# =============================================================================
+
+- name: Deploy SeaweedFS Storage Cluster
+  hosts: localhost
+  connection: local
+  become: true
+
+  vars:
+    seaweedfs_dir: /opt/lakehouse/seaweedfs
+    lakehouse_user: "{{ ansible_env.SUDO_USER | default(ansible_user_id) }}"
+    shared_network: "seaweedfs_default"
+
+    # Image
+    seaweedfs_image: "chrislusf/seaweedfs:latest"
+
+    # Container names
+    seaweedfs_master_container: "seaweedfs-master"
+    seaweedfs_volume_container: "seaweedfs-volume"
+    seaweedfs_filer_container: "seaweedfs-filer"
+    seaweedfs_s3_container: "s3"
+
+    # Ports
+    seaweedfs_master_port: 9333
+    seaweedfs_master_grpc_port: 19333
+    seaweedfs_volume_port: 8080
+    seaweedfs_filer_port: 8888
+    seaweedfs_filer_grpc_port: 18888
+    seaweedfs_s3_port: 8333
+
+    # Volume server settings (WSL-friendly)
+    seaweedfs_volume_max: 100
+    seaweedfs_replication: "000"
+
+    # S3 credentials (used by all lakehouse services)
+    s3_access_key: "dev"
+    s3_secret_key: "dev"
+
+    # Default bucket
+    s3_default_bucket: "lakehouse"
+
+  tasks:
+    # =========================================================================
+    # PRE-FLIGHT CHECKS
+    # =========================================================================
+    - name: Pre-flight - Verify nerdctl is available
+      become: false
+      ansible.builtin.command: nerdctl --version
+      changed_when: false
+
+    - name: Pre-flight - Check port 9333 availability
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ seaweedfs_master_port }}"
+        timeout: 1
+        state: stopped
+      register: port_check_master
+      failed_when: false
+
+    - name: Pre-flight - Check port 8888 availability
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ seaweedfs_filer_port }}"
+        timeout: 1
+        state: stopped
+      register: port_check_filer
+      failed_when: false
+
+    - name: Pre-flight - Check port 8333 availability
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ seaweedfs_s3_port }}"
+        timeout: 1
+        state: stopped
+      register: port_check_s3
+      failed_when: false
+
+    # =========================================================================
+    # DIRECTORY SETUP
+    # =========================================================================
+    - name: Create SeaweedFS directory structure
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ lakehouse_user }}"
+        mode: "0755"
+      loop:
+        - "{{ seaweedfs_dir }}"
+        - "{{ seaweedfs_dir }}/master-data"
+        - "{{ seaweedfs_dir }}/volume-data"
+        - "{{ seaweedfs_dir }}/filer-data"
+
+    # =========================================================================
+    # S3 CONFIGURATION
+    # =========================================================================
+    - name: Write S3 credentials config
+      ansible.builtin.copy:
+        dest: "{{ seaweedfs_dir }}/s3.config.json"
+        owner: "{{ lakehouse_user }}"
+        mode: "0644"
+        content: |
+          {
+            "identities": [
+              {
+                "name": "admin",
+                "credentials": [
+                  {
+                    "accessKey": "{{ s3_access_key }}",
+                    "secretKey": "{{ s3_secret_key }}"
+                  }
+                ],
+                "actions": [
+                  "Admin",
+                  "Read",
+                  "List",
+                  "Tagging",
+                  "Write"
+                ]
+              }
+            ]
+          }
+
+    # =========================================================================
+    # COMPOSE FILE
+    # =========================================================================
+    - name: Write SeaweedFS compose.yaml
+      ansible.builtin.copy:
+        dest: "{{ seaweedfs_dir }}/compose.yaml"
+        owner: "{{ lakehouse_user }}"
+        mode: "0644"
+        content: |
+          version: "3.9"
+
+          services:
+            seaweedfs-master:
+              image: {{ seaweedfs_image }}
+              container_name: {{ seaweedfs_master_container }}
+              command: >
+                master
+                -ip={{ seaweedfs_master_container }}
+                -ip.bind=0.0.0.0
+                -defaultReplication={{ seaweedfs_replication }}
+              ports:
+                - "{{ seaweedfs_master_port }}:9333"
+                - "{{ seaweedfs_master_grpc_port }}:19333"
+              volumes:
+                - ./master-data:/data
+              restart: unless-stopped
+              healthcheck:
+                test: ["CMD", "wget", "-q", "-O-", "http://localhost:9333/cluster/status"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+
+            seaweedfs-volume:
+              image: {{ seaweedfs_image }}
+              container_name: {{ seaweedfs_volume_container }}
+              command: >
+                volume
+                -mserver={{ seaweedfs_master_container }}:9333
+                -ip={{ seaweedfs_volume_container }}
+                -ip.bind=0.0.0.0
+                -port=8080
+                -max={{ seaweedfs_volume_max }}
+              depends_on:
+                seaweedfs-master:
+                  condition: service_healthy
+              volumes:
+                - ./volume-data:/data
+              restart: unless-stopped
+
+            seaweedfs-filer:
+              image: {{ seaweedfs_image }}
+              container_name: {{ seaweedfs_filer_container }}
+              command: >
+                filer
+                -master={{ seaweedfs_master_container }}:9333
+                -ip={{ seaweedfs_filer_container }}
+                -ip.bind=0.0.0.0
+              depends_on:
+                seaweedfs-master:
+                  condition: service_healthy
+                seaweedfs-volume:
+                  condition: service_started
+              ports:
+                - "{{ seaweedfs_filer_port }}:8888"
+                - "{{ seaweedfs_filer_grpc_port }}:18888"
+              volumes:
+                - ./filer-data:/data
+              restart: unless-stopped
+              healthcheck:
+                test: ["CMD", "wget", "-q", "-O-", "http://localhost:8888/"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+
+            s3:
+              image: {{ seaweedfs_image }}
+              container_name: {{ seaweedfs_s3_container }}
+              command: >
+                s3
+                -filer={{ seaweedfs_filer_container }}:8888
+                -ip.bind=0.0.0.0
+                -port=8333
+                -config=/etc/seaweedfs/s3.config.json
+              depends_on:
+                seaweedfs-filer:
+                  condition: service_healthy
+              ports:
+                - "{{ seaweedfs_s3_port }}:8333"
+              volumes:
+                - ./s3.config.json:/etc/seaweedfs/s3.config.json:ro
+              restart: unless-stopped
+              healthcheck:
+                test: ["CMD", "wget", "-q", "-O-", "http://localhost:8333/"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+
+    # =========================================================================
+    # CONTAINER DEPLOYMENT
+    # =========================================================================
+    - name: Check if SeaweedFS master container exists
+      become: false
+      ansible.builtin.command: nerdctl inspect {{ seaweedfs_master_container }}
+      register: seaweedfs_container_check
+      changed_when: false
+      failed_when: false
+
+    - name: Stop existing SeaweedFS containers (for idempotency)
+      become: false
+      ansible.builtin.command: nerdctl compose -f compose.yaml down
+      args:
+        chdir: "{{ seaweedfs_dir }}"
+      when: seaweedfs_container_check.rc == 0
+      changed_when: true
+      failed_when: false
+
+    - name: Pull SeaweedFS image
+      become: false
+      ansible.builtin.command: nerdctl pull {{ seaweedfs_image }}
+      changed_when: false
+      failed_when: false
+
+    - name: Deploy SeaweedFS with nerdctl compose
+      become: false
+      ansible.builtin.command: nerdctl compose -f compose.yaml up -d
+      args:
+        chdir: "{{ seaweedfs_dir }}"
+      register: compose_result
+      changed_when: true
+
+    # =========================================================================
+    # POST-DEPLOYMENT VERIFICATION
+    # =========================================================================
+    - name: Wait for SeaweedFS Master to be ready
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ seaweedfs_master_port }}"
+        timeout: 60
+        state: started
+
+    - name: Wait for SeaweedFS Filer to be ready
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ seaweedfs_filer_port }}"
+        timeout: 60
+        state: started
+
+    - name: Wait for SeaweedFS S3 API to be ready
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ seaweedfs_s3_port }}"
+        timeout: 60
+        state: started
+
+    - name: Verify SeaweedFS Master responds
+      ansible.builtin.uri:
+        url: "http://localhost:{{ seaweedfs_master_port }}/cluster/status"
+        method: GET
+        status_code: [200]
+      register: master_check
+      retries: 5
+      delay: 10
+      until: master_check.status is defined
+
+    - name: Verify SeaweedFS Filer responds
+      ansible.builtin.uri:
+        url: "http://localhost:{{ seaweedfs_filer_port }}/"
+        method: GET
+        status_code: [200]
+      register: filer_check
+      retries: 5
+      delay: 5
+      until: filer_check.status is defined
+
+    - name: Verify SeaweedFS S3 API responds
+      ansible.builtin.uri:
+        url: "http://localhost:{{ seaweedfs_s3_port }}/"
+        method: GET
+        status_code: [200, 403]
+      register: s3_check
+      retries: 5
+      delay: 5
+      until: s3_check.status is defined
+
+    # =========================================================================
+    # CREATE DEFAULT BUCKET
+    # =========================================================================
+    - name: Wait for filer to fully initialize
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Create lakehouse S3 bucket via filer
+      ansible.builtin.uri:
+        url: "http://localhost:{{ seaweedfs_filer_port }}/buckets/{{ s3_default_bucket }}/"
+        method: POST
+        status_code: [200, 201, 301]
+      register: bucket_result
+      retries: 5
+      delay: 5
+      until: bucket_result.status is defined
+      failed_when: false
+
+    - name: Verify network is available for other services
+      become: false
+      ansible.builtin.command: nerdctl network inspect {{ shared_network }}
+      register: net_verify
+      changed_when: false
+
+    - name: Show SeaweedFS deployment info
+      ansible.builtin.debug:
+        msg: |
+          ============================================
+          SeaweedFS Storage deployed successfully!
+          ============================================
+
+          SeaweedFS Master:     http://localhost:{{ seaweedfs_master_port }}
+          SeaweedFS Filer:      http://localhost:{{ seaweedfs_filer_port }}
+          SeaweedFS S3 API:     http://localhost:{{ seaweedfs_s3_port }}
+
+          S3 Credentials:
+            Access Key:         {{ s3_access_key }}
+            Secret Key:         {{ s3_secret_key }}
+            Path Style:         enabled
+
+          Default Bucket:       {{ s3_default_bucket }}
+
+          Network:              {{ shared_network }} (created)
+
+          From host:
+            aws s3 ls --endpoint-url http://localhost:{{ seaweedfs_s3_port }}
+
+          From containers:
+            S3 endpoint:        http://{{ seaweedfs_s3_container }}:{{ seaweedfs_s3_port }}
+            Filer endpoint:     http://{{ seaweedfs_filer_container }}:{{ seaweedfs_filer_port }}
+
+          Data directories:
+            Master:             {{ seaweedfs_dir }}/master-data/
+            Volume:             {{ seaweedfs_dir }}/volume-data/
+            Filer:              {{ seaweedfs_dir }}/filer-data/
+
+          Next step:
+            Deploy lakehouse platform:
+            ansible-playbook 260206_deploy_all_lakehouse_rb_v1_0.yaml
+
+          ============================================

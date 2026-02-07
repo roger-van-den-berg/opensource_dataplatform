@@ -66,28 +66,28 @@
         msg: "FATAL: Network '{{ shared_network }}' not found."
       when: net_check.rc != 0
 
-    - name: Pre-flight - Verify PostgreSQL is running
+    - name: Pre-flight - Verify PostgreSQL container exists
       become: false
       ansible.builtin.command: nerdctl inspect {{ postgres_container }}
       register: pg_check
       changed_when: false
       failed_when: false
 
-    - name: Pre-flight - Fail if PostgreSQL not running
+    - name: Pre-flight - Fail if PostgreSQL not found
       ansible.builtin.fail:
         msg: >
           FATAL: PostgreSQL container '{{ postgres_container }}' not found.
           Deploy shared services first.
       when: pg_check.rc != 0
 
-    - name: Pre-flight - Verify Redis is running
+    - name: Pre-flight - Verify Redis container exists
       become: false
       ansible.builtin.command: nerdctl inspect {{ redis_container }}
       register: redis_check
       changed_when: false
       failed_when: false
 
-    - name: Pre-flight - Fail if Redis not running
+    - name: Pre-flight - Fail if Redis not found
       ansible.builtin.fail:
         msg: >
           FATAL: Redis container '{{ redis_container }}' not found.
@@ -225,16 +225,14 @@
               <<: *superset-common
               container_name: {{ superset_init_container }}
               command: >
-                bash -c "
-                  superset db upgrade &&
-                  superset fab create-admin
-                    --username {{ superset_admin_user }}
-                    --firstname Admin
-                    --lastname User
-                    --email {{ superset_admin_email }}
-                    --password {{ superset_admin_password }} &&
-                  superset init
-                "
+                bash -c "superset db upgrade &&
+                         (superset fab create-admin
+                           --username {{ superset_admin_user }}
+                           --firstname Admin
+                           --lastname User
+                           --email {{ superset_admin_email }}
+                           --password {{ superset_admin_password }} || true) &&
+                         superset init"
               restart: "no"
 
             superset:
@@ -243,16 +241,10 @@
               ports:
                 - "{{ superset_port }}:8088"
               command: >
-                bash -c "
-                  superset db upgrade &&
-                  gunicorn
-                    --bind 0.0.0.0:8088
-                    --access-logfile -
-                    --error-logfile -
-                    --workers 2
-                    --timeout 120
-                    'superset.app:create_app()'
-                "
+                bash -c "exec gunicorn --bind 0.0.0.0:8088
+                         --access-logfile - --error-logfile -
+                         --workers 2 --timeout 120
+                         'superset.app:create_app()'"
               depends_on:
                 - superset-init
               restart: unless-stopped
@@ -294,6 +286,23 @@
         chdir: "{{ superset_dir }}"
       register: compose_result
       changed_when: true
+
+    # Helpful immediate logs (even if compose succeeded, init can still fail)
+    - name: Show superset-init logs (tail)
+      become: false
+      ansible.builtin.command: nerdctl logs --tail=120 {{ superset_init_container }}
+      args:
+        chdir: "{{ superset_dir }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Show superset logs (tail)
+      become: false
+      ansible.builtin.command: nerdctl logs --tail=120 {{ superset_container }}
+      args:
+        chdir: "{{ superset_dir }}"
+      changed_when: false
+      failed_when: false
 
     # =========================================================================
     # POST-DEPLOYMENT VERIFICATION

@@ -96,9 +96,9 @@
       when: not fernet_file.stat.exists
       failed_when: false
 
-    - name: Generate Fernet key fallback (openssl)
+    - name: Generate Fernet key fallback (python3 url-safe base64)
       ansible.builtin.shell: |
-        openssl rand -base64 32
+        python3 -c "import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
       register: fernet_key_fallback
       changed_when: false
       when: not fernet_file.stat.exists and (fernet_key_gen is failed or fernet_key_gen is skipped)

@@ -1,0 +1,38 @@
+# =============================================================================
+# Lakehouse Platform .gitignore
+# =============================================================================
+
+# Generated secrets and keys
+.fernet_key
+.secret_key
+*.key
+*.pem
+
+# Data volumes (managed at /opt/lakehouse/)
+*-data/
+postgres-data/
+redis-data/
+master-data/
+volume-data/
+filer-data/
+
+# Runtime files
+*.log
+*.pid
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Compose runtime
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

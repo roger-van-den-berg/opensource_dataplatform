@@ -12,7 +12,9 @@
 #   Full stack (Phase 0+1+2):
 #     ansible-playbook 260206_deploy_all_lakehouse_rb_v1_0.yaml -e deploy_phase_2=true
 #
-# Note: Assumes SeaweedFS + Databend are already deployed
+# Prerequisite: Deploy SeaweedFS first:
+#   ansible-playbook 260206_seaweedfs-storage_rb_v1_0.yaml
+# Note: Databend is optional (separate deployment)
 # =============================================================================
 
 # =========================================================================

@@ -275,3 +275,69 @@ nerdctl network inspect seaweedfs_default
 nerdctl exec spark-master ping -c 1 s3
 nerdctl exec jupyter ping -c 1 nessie
 ```
+
+## Getting Started Tutorial
+
+After deploying the full stack, verify the end-to-end data flow:
+
+```bash
+# 1. Verify S3 storage is working
+nerdctl exec s3 wget -q -O- http://localhost:8333/ 2>&1 | head -5
+
+# 2. Open JupyterLab and run the starter notebook
+#    http://localhost:8889/lab?token=lakehouse
+#    Open work/00_getting_started.py
+
+# 3. Create an Iceberg table via Spark Thrift
+nerdctl exec spark-thrift /opt/spark/bin/beeline \
+  -u "jdbc:hive2://localhost:10000" \
+  -e "CREATE TABLE nessie.demo.test (id INT, name STRING) USING iceberg;
+      INSERT INTO nessie.demo.test VALUES (1, 'hello'), (2, 'world');
+      SELECT * FROM nessie.demo.test;"
+
+# 4. Query the same table via Trino (Phase 2)
+nerdctl exec trino trino --execute \
+  "SELECT * FROM iceberg.demo.test"
+```
+
+Data flow: **Source** -> **S3 (SeaweedFS)** -> **Iceberg tables (Nessie catalog)** -> **Query engines (Spark/Trino)** -> **Dashboards (Superset)**
+
+## Troubleshooting
+
+| Problem | Cause | Solution |
+|---------|-------|----------|
+| `Network 'seaweedfs_default' not found` | SeaweedFS not deployed | `ansible-playbook 260206_seaweedfs-storage_rb_v1_0.yaml` |
+| `Port already in use` | Previous deployment not cleaned up | `ansible-playbook 260206_teardown_lakehouse_rb_v1_0.yaml` then redeploy |
+| Container OOM killed | Insufficient WSL2 memory | Increase memory in `.wslconfig` or deploy Phase 0+1 only |
+| `PostgreSQL container not found` | Shared services not deployed | `ansible-playbook 260206_shared-services_rb_v1_0.yaml` |
+| Spark JARs download fails | Network issue | Re-run the Spark playbook (retry built-in) |
+| S3 connection refused from container | Wrong endpoint URL | Use `http://s3:8333` (container name), not `localhost` |
+| Nessie API returns 500 | PostgreSQL DB not ready | Wait 30s, check `nerdctl logs nessie` |
+
+```bash
+# Debug any container
+nerdctl logs <container-name>
+nerdctl logs --tail 50 <container-name>
+
+# Restart a single service
+cd /opt/lakehouse/<component>
+nerdctl compose down && nerdctl compose up -d
+
+# Check resource usage
+nerdctl stats --no-stream
+free -h
+```
+
+## Security Notes
+
+This platform uses default credentials suitable for local development. **For production use:**
+
+- Replace all default passwords (`lakehouse`, `admin/admin`, `dev/dev`) with strong unique values
+- Use [Ansible Vault](https://docs.ansible.com/ansible/latest/vault_guide/index.html) to encrypt credentials:
+  ```bash
+  ansible-vault encrypt_string 'my-secret-password' --name 'postgres_password'
+  ```
+- Restrict SeaweedFS S3 credentials in `s3.config.json`
+- Enable TLS for all HTTP services behind a reverse proxy
+- Set `AIRFLOW__WEBSERVER__EXPOSE_CONFIG=false` in production
+- Rotate the Fernet key and Superset secret key regularly

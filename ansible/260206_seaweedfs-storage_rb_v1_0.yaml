@@ -20,8 +20,8 @@
     lakehouse_user: "{{ ansible_env.SUDO_USER | default(ansible_user_id) }}"
     shared_network: "seaweedfs_default"
 
-    # Image
-    seaweedfs_image: "chrislusf/seaweedfs:latest"
+    # Image (pin version for reproducibility)
+    seaweedfs_image: "chrislusf/seaweedfs:3.77"
 
     # Container names
     seaweedfs_master_container: "seaweedfs-master"
@@ -156,7 +156,7 @@
                 - ./master-data:/data
               restart: unless-stopped
               healthcheck:
-                test: ["CMD", "wget", "-q", "-O-", "http://localhost:9333/cluster/status"]
+                test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9333/cluster/status 2>&1"]
                 interval: 10s
                 timeout: 5s
                 retries: 5
@@ -172,8 +172,7 @@
                 -port=8080
                 -max={{ seaweedfs_volume_max }}
               depends_on:
-                seaweedfs-master:
-                  condition: service_healthy
+                - seaweedfs-master
               volumes:
                 - ./volume-data:/data
               restart: unless-stopped
@@ -187,10 +186,8 @@
                 -ip={{ seaweedfs_filer_container }}
                 -ip.bind=0.0.0.0
               depends_on:
-                seaweedfs-master:
-                  condition: service_healthy
-                seaweedfs-volume:
-                  condition: service_started
+                - seaweedfs-master
+                - seaweedfs-volume
               ports:
                 - "{{ seaweedfs_filer_port }}:8888"
                 - "{{ seaweedfs_filer_grpc_port }}:18888"
@@ -198,7 +195,7 @@
                 - ./filer-data:/data
               restart: unless-stopped
               healthcheck:
-                test: ["CMD", "wget", "-q", "-O-", "http://localhost:8888/"]
+                test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8888/ 2>&1"]
                 interval: 10s
                 timeout: 5s
                 retries: 5
@@ -213,18 +210,21 @@
                 -port=8333
                 -config=/etc/seaweedfs/s3.config.json
               depends_on:
-                seaweedfs-filer:
-                  condition: service_healthy
+                - seaweedfs-filer
               ports:
                 - "{{ seaweedfs_s3_port }}:8333"
               volumes:
                 - ./s3.config.json:/etc/seaweedfs/s3.config.json:ro
               restart: unless-stopped
               healthcheck:
-                test: ["CMD", "wget", "-q", "-O-", "http://localhost:8333/"]
+                test: ["CMD-SHELL", "wget -S -O /dev/null http://localhost:8333/ 2>&1 | grep -q 'HTTP/'"]
                 interval: 10s
                 timeout: 5s
                 retries: 5
+
+          networks:
+            default:
+              name: {{ shared_network }}
 
     # =========================================================================
     # CONTAINER DEPLOYMENT
